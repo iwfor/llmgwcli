@@ -28,6 +28,9 @@ llmgwcli usage -g all
 # JSON output for scripts (also works with list-models)
 llmgwcli usage --json | jq '.usage[] | {gateway, cost_usd}'
 
+# Show the version
+llmgwcli --version
+
 # Shell completions (bash or zsh; detected from $SHELL if omitted)
 source <(llmgwcli completions)
 ```

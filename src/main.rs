@@ -810,4 +810,12 @@ mod tests {
         let json = usage_json(&[], date(2026, 10, 1), date(2026, 11, 1));
         assert_eq!(json["usage"], serde_json::json!([]));
     }
+    #[test]
+    fn version_flag_exits_with_the_version_text() {
+        for flag in ["--version", "-V"] {
+            let err = parse(&[flag]).err().expect("version exits early");
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")), "{err}");
+        }
+    }
 }

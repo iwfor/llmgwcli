@@ -757,3 +757,20 @@ fn table_output_is_unchanged_without_the_flag() {
     env.add_litellm("lite", &mock, "good-key", &[]);
     assert!(env.ok(&["list-models"]).starts_with("GATEWAY"));
 }
+
+// --- --version ---
+
+#[test]
+fn version_flag_prints_the_crate_version() {
+    let env = Env::new();
+    let expected = format!("llmgwcli {}\n", env!("CARGO_PKG_VERSION"));
+    assert_eq!(env.ok(&["--version"]), expected);
+    assert_eq!(env.ok(&["-V"]), expected);
+}
+
+#[test]
+fn version_flag_needs_no_config_and_creates_none() {
+    let env = Env::new();
+    env.ok(&["--version"]);
+    assert!(!env.dir().exists());
+}
