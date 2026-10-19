@@ -1,4 +1,5 @@
 mod crypto;
+mod keychain;
 mod provider;
 mod store;
 
@@ -11,7 +12,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 use provider::{Model, ProviderKind, Usage};
-use store::{ALL_GATEWAYS, Config, ProviderConfig, Store};
+use store::{ALL_GATEWAYS, Config, CredentialStore, ProviderConfig, Store};
 
 #[derive(Parser)]
 #[command(version, about = "Client for LLM gateways")]
@@ -47,11 +48,14 @@ enum Command {
         /// Fireworks account id (needed for usage)
         #[arg(long)]
         account_id: Option<String>,
+        /// Where to keep the API key (default: keychain on macOS, file elsewhere)
+        #[arg(long, value_enum)]
+        credential_store: Option<CredentialStore>,
         /// API key (prompted if omitted)
         #[arg(long)]
         api_key: Option<String>,
     },
-    /// Change a gateway's alias, URL, account id or API key
+    /// Change a gateway's alias, URL, account id, credential store or API key
     EditProvider {
         /// Gateway name or alias
         name: String,
@@ -62,6 +66,9 @@ enum Command {
         base_url: Option<String>,
         #[arg(long)]
         account_id: Option<String>,
+        /// Move the API key to this store (the key is kept)
+        #[arg(long, value_enum)]
+        credential_store: Option<CredentialStore>,
         /// New API key (prompted if no value is given)
         #[arg(long, num_args = 0..=1)]
         api_key: Option<Option<String>>,
@@ -142,7 +149,7 @@ fn run(cli: Cli) -> Result<()> {
     };
     let store = Store::open(dir)?;
     match cli.command {
-        Command::AddProvider { name, kind, alias, base_url, account_id, api_key } => {
+        Command::AddProvider { name, kind, alias, base_url, account_id, credential_store, api_key } => {
             let mut config = store.load_config()?;
             config.ensure_free(&name, None)?;
             if let Some(alias) = &alias {
@@ -154,17 +161,22 @@ fn run(cli: Cli) -> Result<()> {
             let base_url = base_url
                 .or_else(|| kind.default_base_url().map(String::from))
                 .context("--base-url is required for this provider type")?;
+            let credential_store = credential_store.unwrap_or_else(CredentialStore::platform_default);
             let api_key = api_key.map_or_else(|| prompt_key(&name), Ok)?;
-            store.set_api_key(&name, &api_key)?;
-            config
-                .providers
-                .insert(name.clone(), ProviderConfig { kind, base_url, alias, account_id });
+            store.set_api_key(&name, &api_key, credential_store)?;
+            config.providers.insert(
+                name.clone(),
+                ProviderConfig { kind, base_url, alias, account_id, credential_store },
+            );
             store.save_config(&config)?;
             println!("Added gateway '{name}'.");
         }
-        Command::EditProvider { name, alias, base_url, account_id, api_key } => {
-            if alias.is_none() && base_url.is_none() && account_id.is_none() && api_key.is_none() {
-                bail!("nothing to change; pass --alias, --base-url, --account-id or --api-key");
+        Command::EditProvider { name, alias, base_url, account_id, credential_store, api_key } => {
+            if [alias.is_some(), base_url.is_some(), account_id.is_some(), credential_store.is_some(), api_key.is_some()]
+                .iter()
+                .all(|changed| !changed)
+            {
+                bail!("nothing to change; pass --alias, --base-url, --account-id, --credential-store or --api-key");
             }
             let mut config = store.load_config()?;
             let name = config.resolve(&name)?;
@@ -184,17 +196,26 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(id) = account_id {
                 gateway.account_id = Some(id);
             }
-            if let Some(key) = api_key {
-                store.set_api_key(&name, &key.map_or_else(|| prompt_key(&name), Ok)?)?;
+            let (old_store, new_store) = (gateway.credential_store, credential_store.unwrap_or(gateway.credential_store));
+            match api_key {
+                Some(key) => {
+                    store.set_api_key(&name, &key.map_or_else(|| prompt_key(&name), Ok)?, new_store)?;
+                    if new_store != old_store {
+                        store.remove_api_key(&name, old_store)?;
+                    }
+                }
+                None if new_store != old_store => store.move_api_key(&name, old_store, new_store)?,
+                None => {}
             }
+            gateway.credential_store = new_store;
             store.save_config(&config)?;
             println!("Updated gateway '{name}'.");
         }
         Command::RemoveProvider { name } => {
             let mut config = store.load_config()?;
             let name = config.resolve(&name)?;
-            config.providers.remove(&name);
-            store.remove_api_key(&name)?;
+            let removed = config.providers.remove(&name).expect("resolved name exists");
+            store.remove_api_key(&name, removed.credential_store)?;
             store.save_config(&config)?;
             println!("Removed gateway '{name}'.");
         }
@@ -233,10 +254,10 @@ fn targets(store: &Store, gateway: &str) -> Result<Vec<Target>> {
         .select(gateway)?
         .into_iter()
         .map(|name| {
-            let api_key = store
-                .api_key(&name)?
-                .with_context(|| format!("no API key for '{name}'"))?;
             let cfg = config.providers[&name].clone();
+            let api_key = store
+                .api_key(&name, cfg.credential_store)?
+                .with_context(|| format!("no API key for '{name}'"))?;
             Ok(Target { name, cfg, api_key })
         })
         .collect()
@@ -368,6 +389,7 @@ mod tests {
                 base_url: "http://localhost".into(),
                 alias: None,
                 account_id: None,
+                credential_store: CredentialStore::File,
             },
             api_key: "k".into(),
         }
@@ -613,9 +635,10 @@ mod tests {
                     base_url: "http://x".into(),
                     alias: alias.map(String::from),
                     account_id: None,
+                    credential_store: CredentialStore::File,
                 },
             );
-            store.set_api_key(name, &format!("key-{name}")).unwrap();
+            store.set_api_key(name, &format!("key-{name}"), CredentialStore::File).unwrap();
         }
         store.save_config(&config).unwrap();
         (tmp, store)
@@ -641,7 +664,7 @@ mod tests {
     fn targets_fails_for_unknown_gateway_or_missing_key() {
         let (_tmp, store) = store_with_gateways();
         assert!(targets(&store, "nope").is_err());
-        store.remove_api_key("lite").unwrap();
+        store.remove_api_key("lite", CredentialStore::File).unwrap();
         let err = targets(&store, "lite").err().unwrap();
         assert!(err.to_string().contains("no API key for 'lite'"));
     }

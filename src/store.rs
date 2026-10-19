@@ -9,12 +9,32 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rand::RngExt;
 use rand::distr::Alphanumeric;
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::crypto;
+use crate::keychain::Keychain;
 use crate::provider::ProviderKind;
 
 const KEY_LEN: usize = 32;
+
+/// Where a gateway's API key is kept.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialStore {
+    /// The macOS Keychain, through the `security` command.
+    Keychain,
+    /// Encrypted in credentials.toml. Also what configs without this setting use.
+    #[default]
+    File,
+}
+
+impl CredentialStore {
+    /// The Keychain on macOS, the credentials file elsewhere.
+    pub fn platform_default() -> Self {
+        if cfg!(target_os = "macos") { Self::Keychain } else { Self::File }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -27,6 +47,9 @@ pub struct ProviderConfig {
     /// Fireworks account slug, needed for billing/usage queries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    /// Where this gateway's API key lives.
+    #[serde(default)]
+    pub credential_store: CredentialStore,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -78,15 +101,20 @@ struct Credentials {
 
 pub struct Store {
     dir: PathBuf,
+    keychain: Keychain,
 }
 
 impl Store {
     /// Opens the store and makes sure the directory and key file exist
     /// with user-only permissions.
     pub fn open(dir: PathBuf) -> Result<Self> {
+        Self::open_with_keychain(dir, Keychain::new())
+    }
+
+    pub fn open_with_keychain(dir: PathBuf, keychain: Keychain) -> Result<Self> {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-        let store = Store { dir };
+        let store = Store { dir, keychain };
         store.ensure_key()?;
         Ok(store)
     }
@@ -124,7 +152,38 @@ impl Store {
         write_toml(&self.path("config.toml"), config)
     }
 
-    pub fn api_key(&self, provider: &str) -> Result<Option<String>> {
+    pub fn api_key(&self, provider: &str, backend: CredentialStore) -> Result<Option<String>> {
+        match backend {
+            CredentialStore::Keychain => self.keychain.get(provider),
+            CredentialStore::File => self.file_api_key(provider),
+        }
+    }
+
+    pub fn set_api_key(&self, provider: &str, api_key: &str, backend: CredentialStore) -> Result<()> {
+        match backend {
+            CredentialStore::Keychain => self.keychain.set(provider, api_key),
+            CredentialStore::File => self.set_file_api_key(provider, api_key),
+        }
+    }
+
+    pub fn remove_api_key(&self, provider: &str, backend: CredentialStore) -> Result<()> {
+        match backend {
+            CredentialStore::Keychain => self.keychain.remove(provider),
+            CredentialStore::File => self.remove_file_api_key(provider),
+        }
+    }
+
+    /// Copies the key to the new backend, then removes it from the old one.
+    /// The old key is kept if the write fails.
+    pub fn move_api_key(&self, provider: &str, from: CredentialStore, to: CredentialStore) -> Result<()> {
+        let key = self
+            .api_key(provider, from)?
+            .with_context(|| format!("no API key stored for '{provider}' to move"))?;
+        self.set_api_key(provider, &key, to)?;
+        self.remove_api_key(provider, from)
+    }
+
+    fn file_api_key(&self, provider: &str) -> Result<Option<String>> {
         let creds: Credentials = read_toml(&self.path("credentials.toml"))?;
         creds
             .providers
@@ -133,7 +192,7 @@ impl Store {
             .transpose()
     }
 
-    pub fn set_api_key(&self, provider: &str, api_key: &str) -> Result<()> {
+    fn set_file_api_key(&self, provider: &str, api_key: &str) -> Result<()> {
         let path = self.path("credentials.toml");
         let mut creds: Credentials = read_toml(&path)?;
         let enc = crypto::encrypt(&self.key()?, api_key)?;
@@ -141,7 +200,7 @@ impl Store {
         write_toml(&path, &creds)
     }
 
-    pub fn remove_api_key(&self, provider: &str) -> Result<()> {
+    fn remove_file_api_key(&self, provider: &str) -> Result<()> {
         let path = self.path("credentials.toml");
         let mut creds: Credentials = read_toml(&path)?;
         creds.providers.remove(provider);
@@ -179,15 +238,21 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keychain::Keychain;
     use tempfile::TempDir;
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_security.sh");
+
+    /// Store whose keychain is the fake `security` script, with its state in `keychain/`.
     fn open() -> (TempDir, Store) {
         let tmp = TempDir::new().unwrap();
-        let store = Store::open(tmp.path().join("cfg")).unwrap();
+        let keychain = Keychain::with_program(FAKE)
+            .with_env("FAKE_SECURITY_DIR", tmp.path().join("keychain"));
+        let store = Store::open_with_keychain(tmp.path().join("cfg"), keychain).unwrap();
         (tmp, store)
     }
 
@@ -197,6 +262,7 @@ mod tests {
             base_url: "http://localhost:4000".into(),
             alias: alias.map(String::from),
             account_id: None,
+            credential_store: CredentialStore::File,
         }
     }
 
@@ -223,7 +289,7 @@ mod tests {
     fn open_keeps_existing_key() {
         let (tmp, store) = open();
         let first = store.key().unwrap();
-        let again = Store::open(tmp.path().join("cfg")).unwrap();
+        let again = Store::open_with_keychain(tmp.path().join("cfg"), Keychain::new()).unwrap();
         assert_eq!(again.key().unwrap(), first);
     }
 
@@ -233,7 +299,7 @@ mod tests {
         let dir = tmp.path().join("cfg");
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(dir.join("llmgwcli.key"), fs::Permissions::from_mode(0o644)).unwrap();
-        Store::open(dir.clone()).unwrap();
+        Store::open_with_keychain(dir.clone(), Keychain::new()).unwrap();
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&dir.join("llmgwcli.key")), 0o600);
     }
@@ -282,8 +348,8 @@ mod tests {
     #[test]
     fn api_key_is_encrypted_and_round_trips() {
         let (tmp, store) = open();
-        store.set_api_key("lite", "sk-plain-secret").unwrap();
-        assert_eq!(store.api_key("lite").unwrap().as_deref(), Some("sk-plain-secret"));
+        store.set_api_key("lite", "sk-plain-secret", CredentialStore::File).unwrap();
+        assert_eq!(store.api_key("lite", CredentialStore::File).unwrap().as_deref(), Some("sk-plain-secret"));
         let text = fs::read_to_string(tmp.path().join("cfg/credentials.toml")).unwrap();
         assert!(!text.contains("sk-plain-secret"));
         assert_eq!(mode(&tmp.path().join("cfg/credentials.toml")), 0o600);
@@ -292,35 +358,35 @@ mod tests {
     #[test]
     fn api_key_missing_is_none() {
         let (_tmp, store) = open();
-        assert_eq!(store.api_key("nope").unwrap(), None);
+        assert_eq!(store.api_key("nope", CredentialStore::File).unwrap(), None);
     }
 
     #[test]
     fn set_api_key_replaces_and_keeps_others() {
         let (_tmp, store) = open();
-        store.set_api_key("a", "one").unwrap();
-        store.set_api_key("b", "two").unwrap();
-        store.set_api_key("a", "three").unwrap();
-        assert_eq!(store.api_key("a").unwrap().as_deref(), Some("three"));
-        assert_eq!(store.api_key("b").unwrap().as_deref(), Some("two"));
+        store.set_api_key("a", "one", CredentialStore::File).unwrap();
+        store.set_api_key("b", "two", CredentialStore::File).unwrap();
+        store.set_api_key("a", "three", CredentialStore::File).unwrap();
+        assert_eq!(store.api_key("a", CredentialStore::File).unwrap().as_deref(), Some("three"));
+        assert_eq!(store.api_key("b", CredentialStore::File).unwrap().as_deref(), Some("two"));
     }
 
     #[test]
     fn remove_api_key_only_removes_that_gateway() {
         let (_tmp, store) = open();
-        store.set_api_key("a", "one").unwrap();
-        store.set_api_key("b", "two").unwrap();
-        store.remove_api_key("a").unwrap();
-        assert_eq!(store.api_key("a").unwrap(), None);
-        assert_eq!(store.api_key("b").unwrap().as_deref(), Some("two"));
+        store.set_api_key("a", "one", CredentialStore::File).unwrap();
+        store.set_api_key("b", "two", CredentialStore::File).unwrap();
+        store.remove_api_key("a", CredentialStore::File).unwrap();
+        assert_eq!(store.api_key("a", CredentialStore::File).unwrap(), None);
+        assert_eq!(store.api_key("b", CredentialStore::File).unwrap().as_deref(), Some("two"));
     }
 
     #[test]
     fn api_key_fails_with_a_different_key_file() {
         let (tmp, store) = open();
-        store.set_api_key("a", "one").unwrap();
+        store.set_api_key("a", "one", CredentialStore::File).unwrap();
         fs::write(tmp.path().join("cfg/llmgwcli.key"), "A".repeat(32)).unwrap();
-        assert!(store.api_key("a").is_err());
+        assert!(store.api_key("a", CredentialStore::File).is_err());
     }
 
     #[test]
@@ -365,5 +431,94 @@ mod tests {
         let config = config();
         assert!(config.ensure_free("ll", Some("lite")).is_ok());
         assert!(config.ensure_free("ll", Some("other")).is_err());
+    }
+    use CredentialStore::{File, Keychain as InKeychain};
+
+    #[test]
+    fn platform_default_is_keychain_only_on_macos() {
+        let expected = if cfg!(target_os = "macos") { InKeychain } else { File };
+        assert_eq!(CredentialStore::platform_default(), expected);
+    }
+
+    #[test]
+    fn config_without_credential_store_reads_as_file() {
+        let (tmp, store) = open();
+        fs::write(
+            tmp.path().join("cfg/config.toml"),
+            "[providers.old]\ntype = \"litellm\"\nbase_url = \"http://x\"\n",
+        )
+        .unwrap();
+        assert_eq!(store.load_config().unwrap().providers["old"].credential_store, File);
+    }
+
+    #[test]
+    fn credential_store_is_saved_in_config() {
+        let (tmp, store) = open();
+        let mut config = config();
+        config.providers.get_mut("lite").unwrap().credential_store = InKeychain;
+        store.save_config(&config).unwrap();
+        let text = fs::read_to_string(tmp.path().join("cfg/config.toml")).unwrap();
+        assert!(text.contains("credential_store = \"keychain\""), "{text}");
+        assert_eq!(store.load_config().unwrap().providers["lite"].credential_store, InKeychain);
+    }
+
+    #[test]
+    fn keychain_secret_stays_out_of_the_credentials_file() {
+        let (tmp, store) = open();
+        store.set_api_key("a", "sk-in-keychain", InKeychain).unwrap();
+        assert_eq!(store.api_key("a", InKeychain).unwrap().as_deref(), Some("sk-in-keychain"));
+        assert_eq!(store.api_key("a", File).unwrap(), None);
+        let creds = fs::read_to_string(tmp.path().join("cfg/credentials.toml")).unwrap_or_default();
+        assert!(!creds.contains("sk-in-keychain") && !creds.contains("a ="), "{creds}");
+    }
+
+    #[test]
+    fn file_secret_stays_out_of_the_keychain() {
+        let (tmp, store) = open();
+        store.set_api_key("a", "sk-in-file", File).unwrap();
+        assert_eq!(store.api_key("a", InKeychain).unwrap(), None);
+        assert!(!tmp.path().join("keychain").join("llmgwcli.a").exists());
+    }
+
+    #[test]
+    fn remove_api_key_uses_the_given_backend() {
+        let (_tmp, store) = open();
+        store.set_api_key("a", "kc", InKeychain).unwrap();
+        store.set_api_key("a", "file", File).unwrap();
+        store.remove_api_key("a", InKeychain).unwrap();
+        assert_eq!(store.api_key("a", InKeychain).unwrap(), None);
+        assert_eq!(store.api_key("a", File).unwrap().as_deref(), Some("file"));
+    }
+
+    #[test]
+    fn move_api_key_between_backends() {
+        let (_tmp, store) = open();
+        store.set_api_key("a", "sk-move", File).unwrap();
+        store.move_api_key("a", File, InKeychain).unwrap();
+        assert_eq!(store.api_key("a", InKeychain).unwrap().as_deref(), Some("sk-move"));
+        assert_eq!(store.api_key("a", File).unwrap(), None);
+        store.move_api_key("a", InKeychain, File).unwrap();
+        assert_eq!(store.api_key("a", File).unwrap().as_deref(), Some("sk-move"));
+        assert_eq!(store.api_key("a", InKeychain).unwrap(), None);
+    }
+
+    #[test]
+    fn move_api_key_without_a_stored_key_fails() {
+        let (_tmp, store) = open();
+        let err = store.move_api_key("a", File, InKeychain).unwrap_err();
+        assert!(err.to_string().contains("no API key"), "{err}");
+        assert_eq!(store.api_key("a", InKeychain).unwrap(), None);
+    }
+
+    #[test]
+    fn failed_keychain_write_keeps_the_old_key() {
+        let (tmp, store) = open();
+        store.set_api_key("a", "sk-keep", File).unwrap();
+        let broken = Keychain::with_program(FAKE)
+            .with_env("FAKE_SECURITY_DIR", tmp.path().join("keychain"))
+            .with_env("FAKE_SECURITY_FAIL", "1");
+        let store = Store::open_with_keychain(tmp.path().join("cfg"), broken).unwrap();
+        assert!(store.move_api_key("a", File, InKeychain).is_err());
+        assert_eq!(store.api_key("a", File).unwrap().as_deref(), Some("sk-keep"));
     }
 }

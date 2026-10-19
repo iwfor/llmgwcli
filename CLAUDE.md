@@ -13,14 +13,17 @@
 - Default dir: `~/.config/llmgwcli` (override with `--config-dir` or `LLMGWCLI_CONFIG_DIR`).
 - Dir is mode 0700; all files are 0600.
 - `llmgwcli.key`: random 32-char alphanumeric key, created if missing.
-- `credentials.toml`: API keys encrypted with the key (ChaCha20-Poly1305, base64 of nonce+ciphertext).
+- `credentials.toml`: API keys encrypted with the key (ChaCha20-Poly1305, base64 of nonce+ciphertext). Only used by gateways whose credential store is `file`.
+- Credential store is per gateway (`credential_store = "keychain" | "file"` in config.toml). Default: `keychain` on macOS, `file` elsewhere. Configs without the field are read as `file`, so older configs keep working.
+- Keychain (`src/keychain.rs`): service `llmgwcli`, account = gateway name, through the `security` command. Secrets are written by piping `add-generic-password -U ...` to `security -i` on stdin so they never show up in `ps`. Missing item = exit code 44.
+- Test hook: `LLMGWCLI_SECURITY_BIN` replaces the `security` program (tests use `tests/fake_security.sh`; the e2e tests always set it so they never touch the real keychain).
 - `config.toml`: all other settings (`[providers.<name>]` with `type` and `base_url`).
 - Format is TOML.
 
 ## Commands
 Commands keep the `*-provider` names; "gateway" is the user-facing word.
-- `add-provider <name> --type litellm|fireworks [--alias A] [--base-url] [--account-id] [--api-key]` (key is prompted if omitted)
-- `edit-provider <name|alias> [--alias A ("" removes)] [--base-url] [--account-id] [--api-key [KEY]]`
+- `add-provider <name> --type litellm|fireworks [--alias A] [--base-url] [--account-id] [--credential-store keychain|file] [--api-key]` (key is prompted if omitted)
+- `edit-provider <name|alias> [--alias A ("" removes)] [--base-url] [--account-id] [--credential-store keychain|file] [--api-key [KEY]]` (`--credential-store` moves the existing key to the new store)
 - `remove-provider <name|alias>`
 - `list-models [-g GATEWAY] [--filter TEXT]`: price per 1M tokens; filter is a case-insensitive substring on model id.
 - `usage [-g GATEWAY]`: current month (UTC, 1st to 1st of next month) cost and tokens.
@@ -32,6 +35,7 @@ Commands keep the `*-provider` names; "gateway" is the user-facing word.
 - `src/main.rs`: CLI and command handlers
 - `src/store.rs`: config/credentials/key files and permissions
 - `src/crypto.rs`: encrypt/decrypt
+- `src/keychain.rs`: macOS Keychain via the `security` command
 - `src/provider.rs`: provider kinds and model listing
 
 ## Testing
@@ -39,6 +43,8 @@ Commands keep the `*-provider` names; "gateway" is the user-facing word.
 - `tests/cli.rs` runs the real binary with `--config-dir` set to a temp dir and a mock HTTP gateway (`Mock`) on 127.0.0.1. No real network or real keys are used.
 - Keep pure logic separate from I/O so it can be unit tested (e.g. `parse_*` in `provider.rs`, `month_window`, `format_table`, `model_rows`).
 - Table tests check structure (cell order, alignment), not exact spacing, so tweaking column gaps does not break them.
+- `tests/fake_security.sh` is a stateful fake `security` (state in `$FAKE_SECURITY_DIR`, logs argv/stdin, `FAKE_SECURITY_FAIL=1` makes it fail). Used by unit and e2e tests.
+- `cargo test -- --ignored` also runs `real_keychain_round_trip`, which uses the real macOS keychain (run it by hand after touching `keychain.rs`).
 - Not tested: the interactive API-key prompt (needs a TTY) and real gateway responses (only mocks are used).
 
 ## Provider notes

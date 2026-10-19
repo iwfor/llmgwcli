@@ -38,10 +38,19 @@ Files live in `~/.config/llmgwcli` (override with `--config-dir` or `LLMGWCLI_CO
 | File | Contents |
 |------|----------|
 | `config.toml` | Gateways, URLs, aliases |
-| `credentials.toml` | API keys, encrypted |
-| `llmgwcli.key` | Random 32-character key used to encrypt credentials |
+| `credentials.toml` | API keys for gateways that use the `file` credential store, encrypted |
+| `llmgwcli.key` | Random 32-character key used to encrypt `credentials.toml` |
 
-Keep `llmgwcli.key` safe. Without it, stored API keys cannot be decrypted.
+### Where API keys are kept
+
+Each gateway keeps its API key in one of two places:
+
+- `keychain` (default on macOS): the Apple Keychain, through the `security` command. The key never goes into our files and is never passed as a command-line argument.
+- `file` (default elsewhere): encrypted in `credentials.toml`.
+
+Pick one with `--credential-store keychain|file` on `add-provider`. Move an existing key with `edit-provider NAME --credential-store file`. Gateways added before this option existed keep using the file.
+
+If you use the `file` store, keep `llmgwcli.key` safe. Without it, stored API keys cannot be decrypted.
 
 ## Status
 

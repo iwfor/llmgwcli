@@ -321,6 +321,7 @@ mod tests {
             base_url: "http://127.0.0.1:1/inference/v1".into(),
             alias: None,
             account_id: None,
+            credential_store: crate::store::CredentialStore::File,
         };
         let day = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
         let err = fireworks_usage(&cfg, "k", day, day).unwrap_err();

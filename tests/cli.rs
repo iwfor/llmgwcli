@@ -71,6 +71,8 @@ impl Mock {
     }
 }
 
+const FAKE_SECURITY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_security.sh");
+
 struct Env {
     tmp: TempDir,
 }
@@ -88,7 +90,27 @@ impl Env {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_llmgwcli"));
         cmd.arg("--config-dir").arg(self.dir()).args(args);
         cmd.env_remove("LLMGWCLI_CONFIG_DIR");
+        // Never touch the real keychain: use the fake `security` script.
+        cmd.env("LLMGWCLI_SECURITY_BIN", FAKE_SECURITY);
+        cmd.env("FAKE_SECURITY_DIR", self.keychain_dir());
         cmd
+    }
+
+    fn keychain_dir(&self) -> std::path::PathBuf {
+        self.tmp.path().join("keychain")
+    }
+
+    /// The secret the fake keychain holds for a gateway, if any.
+    fn keychain_secret(&self, account: &str) -> Option<String> {
+        std::fs::read_to_string(self.keychain_dir().join(format!("llmgwcli.{account}"))).ok()
+    }
+
+    fn keychain_log(&self, name: &str) -> String {
+        std::fs::read_to_string(self.keychain_dir().join(name)).unwrap_or_default()
+    }
+
+    fn credentials(&self) -> String {
+        std::fs::read_to_string(self.dir().join("credentials.toml")).unwrap_or_default()
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -131,7 +153,7 @@ fn mode(path: &std::path::Path) -> u32 {
 #[test]
 fn add_creates_private_encrypted_config() {
     let env = Env::new();
-    env.ok(&["add-provider", "fw", "--type", "fireworks", "--api-key", "sk-plain"]);
+    env.ok(&["add-provider", "fw", "--type", "fireworks", "--credential-store", "file", "--api-key", "sk-plain"]);
     let dir = env.dir();
     assert_eq!(mode(&dir), 0o700);
     for file in ["config.toml", "credentials.toml", "llmgwcli.key"] {
@@ -148,7 +170,7 @@ fn config_dir_can_come_from_the_environment() {
     let dir = env.tmp.path().join("from-env");
     let out = Command::new(env!("CARGO_BIN_EXE_llmgwcli"))
         .env("LLMGWCLI_CONFIG_DIR", &dir)
-        .args(["add-provider", "fw", "--type", "fireworks", "--api-key", "k"])
+        .args(["add-provider", "fw", "--type", "fireworks", "--credential-store", "file", "--api-key", "k"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -224,8 +246,8 @@ fn edit_needs_a_change_and_a_known_gateway() {
 #[test]
 fn remove_deletes_config_and_credentials() {
     let env = Env::new();
-    env.ok(&["add-provider", "a", "--type", "fireworks", "--alias", "x", "--api-key", "k"]);
-    env.ok(&["add-provider", "b", "--type", "fireworks", "--api-key", "k"]);
+    env.ok(&["add-provider", "a", "--type", "fireworks", "--alias", "x", "--credential-store", "file", "--api-key", "k"]);
+    env.ok(&["add-provider", "b", "--type", "fireworks", "--credential-store", "file", "--api-key", "k"]);
     env.ok(&["remove-provider", "x"]);
     let config = env.config();
     assert!(!config.contains("providers.a]") && config.contains("providers.b]"));
@@ -363,4 +385,185 @@ fn explicit_shell_overrides_environment() {
     let env = Env::new();
     let out = env.cmd(&["completions", "bash"]).env("SHELL", "/bin/zsh").output().unwrap();
     assert!(!text(&out.stdout).starts_with("#compdef"));
+}
+
+// --- credential stores ---
+
+/// Adds a litellm gateway pointing at `mock`, using the given credential store.
+fn add_with_store(env: &Env, mock: &Mock, key: &str, store: &str) {
+    env.add_litellm("lite", mock, key, &["--credential-store", store]);
+}
+
+#[test]
+fn default_credential_store_depends_on_the_platform() {
+    let env = Env::new();
+    env.ok(&["add-provider", "fw", "--type", "fireworks", "--api-key", "good-key"]);
+    let expected = if cfg!(target_os = "macos") { "keychain" } else { "file" };
+    assert!(env.config().contains(&format!("credential_store = \"{expected}\"")), "{}", env.config());
+}
+
+#[test]
+fn keychain_store_keeps_the_key_out_of_our_files() {
+    let env = Env::new();
+    env.ok(&["add-provider", "fw", "--type", "fireworks", "--credential-store", "keychain", "--api-key", "sk-in-keychain"]);
+    assert_eq!(env.keychain_secret("fw").as_deref(), Some("sk-in-keychain"));
+    assert!(env.config().contains("credential_store = \"keychain\""));
+    assert!(!env.credentials().contains("fw"), "{}", env.credentials());
+    assert!(!env.keychain_log("argv.log").contains("sk-in-keychain"), "secret leaked into argv");
+    assert!(env.keychain_log("stdin.log").contains("sk-in-keychain"));
+}
+
+#[test]
+fn file_store_flag_skips_the_keychain() {
+    let env = Env::new();
+    env.ok(&["add-provider", "fw", "--type", "fireworks", "--credential-store", "file", "--api-key", "sk-in-file"]);
+    assert!(env.config().contains("credential_store = \"file\""));
+    assert!(env.credentials().contains("fw = "));
+    assert!(!env.credentials().contains("sk-in-file"));
+    assert_eq!(env.keychain_secret("fw"), None);
+    assert_eq!(env.keychain_log("argv.log"), "", "security must not be called");
+}
+
+#[test]
+fn unknown_credential_store_is_rejected() {
+    let env = Env::new();
+    let err = env.fails(&["add-provider", "fw", "--type", "fireworks", "--credential-store", "vault", "--api-key", "k"]);
+    assert!(err.contains("possible values"), "{err}");
+}
+
+#[test]
+fn queries_read_the_key_from_the_gateways_own_store() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    add_with_store(&env, &mock, "good-key", "keychain");
+    assert!(env.ok(&["list-models"]).contains("llama-70b"));
+    let file_env = Env::new();
+    add_with_store(&file_env, &mock, "good-key", "file");
+    assert!(file_env.ok(&["list-models"]).contains("llama-70b"));
+}
+
+#[test]
+fn gateways_can_mix_credential_stores() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/user/daily/activity", LITELLM_USAGE)]);
+    env.add_litellm("one", &mock, "good-key", &["--credential-store", "keychain"]);
+    env.add_litellm("two", &mock, "good-key", &["--credential-store", "file"]);
+    let out = env.ok(&["usage"]);
+    assert!(out.contains("one") && out.contains("two"), "{out}");
+}
+
+#[test]
+fn missing_keychain_entry_is_reported() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    add_with_store(&env, &mock, "good-key", "keychain");
+    std::fs::remove_file(env.keychain_dir().join("llmgwcli.lite")).unwrap();
+    assert!(env.fails(&["list-models"]).contains("no API key for 'lite'"));
+}
+
+#[test]
+fn legacy_config_without_credential_store_uses_the_file() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    add_with_store(&env, &mock, "good-key", "file");
+    let stripped: String = env.config().lines().filter(|l| !l.starts_with("credential_store")).map(|l| format!("{l}\n")).collect();
+    std::fs::write(env.dir().join("config.toml"), stripped).unwrap();
+    assert!(env.ok(&["list-models"]).contains("llama-70b"));
+}
+
+#[test]
+fn remove_deletes_the_keychain_entry() {
+    let env = Env::new();
+    env.ok(&["add-provider", "a", "--type", "fireworks", "--credential-store", "keychain", "--api-key", "k1"]);
+    env.ok(&["add-provider", "b", "--type", "fireworks", "--credential-store", "keychain", "--api-key", "k2"]);
+    env.ok(&["remove-provider", "a"]);
+    assert_eq!(env.keychain_secret("a"), None);
+    assert_eq!(env.keychain_secret("b").as_deref(), Some("k2"));
+}
+
+#[test]
+fn edit_api_key_updates_the_keychain_entry() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    add_with_store(&env, &mock, "bad-key", "keychain");
+    assert!(env.fails(&["list-models"]).contains("401"));
+    env.ok(&["edit-provider", "lite", "--api-key", "good-key"]);
+    assert_eq!(env.keychain_secret("lite").as_deref(), Some("good-key"));
+    assert!(env.ok(&["list-models"]).contains("llama-70b"));
+}
+
+#[test]
+fn edit_credential_store_moves_the_key_both_ways() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    add_with_store(&env, &mock, "good-key", "keychain");
+
+    env.ok(&["edit-provider", "lite", "--credential-store", "file"]);
+    assert_eq!(env.keychain_secret("lite"), None);
+    assert!(env.credentials().contains("lite = "));
+    assert!(env.config().contains("credential_store = \"file\""));
+    assert!(env.ok(&["list-models"]).contains("llama-70b"));
+
+    env.ok(&["edit-provider", "lite", "--credential-store", "keychain"]);
+    assert_eq!(env.keychain_secret("lite").as_deref(), Some("good-key"));
+    assert!(!env.credentials().contains("lite = "));
+    assert!(env.ok(&["list-models"]).contains("llama-70b"));
+}
+
+#[test]
+fn edit_credential_store_with_new_key_stores_it_in_the_new_place_only() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    add_with_store(&env, &mock, "bad-key", "keychain");
+    env.ok(&["edit-provider", "lite", "--credential-store", "file", "--api-key", "good-key"]);
+    assert_eq!(env.keychain_secret("lite"), None);
+    assert!(env.ok(&["list-models"]).contains("llama-70b"));
+}
+
+#[test]
+fn edit_to_the_current_store_changes_nothing() {
+    let env = Env::new();
+    env.ok(&["add-provider", "fw", "--type", "fireworks", "--credential-store", "keychain", "--api-key", "k"]);
+    env.ok(&["edit-provider", "fw", "--credential-store", "keychain"]);
+    assert_eq!(env.keychain_secret("fw").as_deref(), Some("k"));
+}
+
+#[test]
+fn failed_keychain_write_does_not_add_the_gateway() {
+    let env = Env::new();
+    let out = env
+        .cmd(&["add-provider", "fw", "--type", "fireworks", "--credential-store", "keychain", "--api-key", "k"])
+        .env("FAKE_SECURITY_FAIL", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("security failed"), "{}", text(&out.stderr));
+    let config = std::fs::read_to_string(env.dir().join("config.toml")).unwrap_or_default();
+    assert!(!config.contains("fw"), "{config}");
+}
+
+#[test]
+fn failed_move_keeps_the_old_key_and_config() {
+    let env = Env::new();
+    env.ok(&["add-provider", "fw", "--type", "fireworks", "--credential-store", "file", "--api-key", "k"]);
+    let out = env
+        .cmd(&["edit-provider", "fw", "--credential-store", "keychain"])
+        .env("FAKE_SECURITY_FAIL", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(env.config().contains("credential_store = \"file\""));
+    assert!(env.credentials().contains("fw = "));
+}
+
+#[test]
+fn missing_security_command_gives_a_clear_error() {
+    let env = Env::new();
+    let out = env
+        .cmd(&["add-provider", "fw", "--type", "fireworks", "--credential-store", "keychain", "--api-key", "k"])
+        .env("LLMGWCLI_SECURITY_BIN", "/nonexistent/security")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("running /nonexistent/security"), "{}", text(&out.stderr));
 }
