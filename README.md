@@ -25,11 +25,16 @@ llmgwcli list-models -g fw --filter llama
 # This month's usage (UTC)
 llmgwcli usage -g all
 
+# JSON output for scripts (also works with list-models)
+llmgwcli usage --json | jq '.usage[] | {gateway, cost_usd}'
+
 # Shell completions (bash or zsh; detected from $SHELL if omitted)
 source <(llmgwcli completions)
 ```
 
 `-g/--gateway` takes a gateway name or alias. The default, `all`, queries every gateway in parallel.
+
+`--json` prints JSON instead of a table. Unknown values are `null`. Errors and progress messages go to stderr, so stdout is always valid JSON. If some gateways fail, the others are still printed and the exit code is 1.
 
 ## Rate limits
 

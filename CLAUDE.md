@@ -26,8 +26,9 @@ Commands keep the `*-provider` names; "gateway" is the user-facing word.
 - `add-provider <name> --type litellm|fireworks [--alias A] [--base-url] [--account-id] [--credential-store keychain|file] [--api-key]` (key is prompted if omitted)
 - `edit-provider <name|alias> [--alias A ("" removes)] [--base-url] [--account-id] [--credential-store keychain|file] [--api-key [KEY]]` (`--credential-store` moves the existing key to the new store)
 - `remove-provider <name|alias>`
-- `list-models [-g GATEWAY] [--filter TEXT]`: price per 1M tokens; filter is a case-insensitive substring on model id.
-- `usage [-g GATEWAY]`: current month (UTC, 1st to 1st of next month) cost and tokens.
+- `list-models [-g GATEWAY] [--filter TEXT] [--json]`: price per 1M tokens; filter is a case-insensitive substring on model id.
+- `usage [-g GATEWAY] [--json]`: current month (UTC, 1st to 1st of next month) cost and tokens.
+- `--json` (list-models, usage): stdout is only JSON; errors and rate-limit notices stay on stderr and the exit code is unchanged. list-models prints an array of `{gateway, model, input_per_million, output_per_million}`; usage prints `{start, end, usage: [{gateway, cost_usd, prompt_tokens, completion_tokens, requests}]}`. Unknown values are `null` (tables show `-`). Prices are rounded to 6 decimals to drop float noise.
 - `completions [bash|zsh]`: prints a completion script (clap_complete); shell comes from `$SHELL` if omitted. Handled before the config dir is opened, so it creates no files. Completions are static (gateway names are not completed).
 - `-g/--gateway` takes a name or alias; default and special value `all` queries every gateway in parallel (threads). Failures print to stderr, other results still print, exit code 1.
 - `all` is reserved; names and aliases must be unique across both.

@@ -674,3 +674,86 @@ fn one_rate_limited_gateway_does_not_block_the_others() {
     assert!(text(&out.stdout).contains("fast") && text(&out.stdout).contains("12.3456"));
     assert!(text(&out.stderr).contains("gateway 'slow'") && text(&out.stderr).contains("exceeds"));
 }
+
+// --- --json output ---
+
+fn json(out: &str) -> serde_json::Value {
+    serde_json::from_str(out).unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {out}"))
+}
+
+#[test]
+fn list_models_json_prints_only_a_json_array() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    env.add_litellm("lite", &mock, "good-key", &["--alias", "ll"]);
+    let out = env.ok(&["list-models", "--json", "-g", "ll"]);
+    assert!(out.trim_start().starts_with('['), "{out}");
+    assert_eq!(
+        json(&out),
+        serde_json::json!([
+            {"gateway": "lite", "model": "llama-70b", "input_per_million": 0.9, "output_per_million": 1.8},
+            {"gateway": "lite", "model": "mixtral", "input_per_million": null, "output_per_million": null},
+        ])
+    );
+}
+
+#[test]
+fn list_models_json_honours_the_filter() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    env.add_litellm("lite", &mock, "good-key", &[]);
+    let models = json(&env.ok(&["list-models", "--json", "--filter", "MIX"]));
+    assert_eq!(models.as_array().unwrap().len(), 1);
+    assert_eq!(models[0]["model"], "mixtral");
+    assert_eq!(json(&env.ok(&["list-models", "--json", "--filter", "zzz"])), serde_json::json!([]));
+}
+
+#[test]
+fn usage_json_prints_the_month_and_totals() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/user/daily/activity", LITELLM_USAGE)]);
+    env.add_litellm("lite", &mock, "good-key", &[]);
+    let out = env.ok(&["usage", "--json"]);
+    let usage = json(&out);
+    assert_eq!(usage["start"], chrono::Utc::now().format("%Y-%m-01").to_string());
+    assert!(usage["end"].as_str().unwrap().ends_with("-01"));
+    assert_eq!(
+        usage["usage"],
+        serde_json::json!([{"gateway": "lite", "cost_usd": 12.3456, "prompt_tokens": 1000,
+                            "completion_tokens": 500, "requests": 42}])
+    );
+    assert!(!out.contains("Usage "), "no table header in JSON mode: {out}");
+}
+
+#[test]
+fn json_mode_keeps_stdout_clean_when_a_gateway_fails() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/user/daily/activity", LITELLM_USAGE)]);
+    env.add_litellm("good", &mock, "good-key", &[]);
+    env.add_litellm("bad", &mock, "bad-key", &[]);
+    let out = env.run(&["usage", "--json"]);
+    assert!(!out.status.success());
+    let usage = json(&text(&out.stdout));
+    assert_eq!(usage["usage"].as_array().unwrap().len(), 1);
+    assert_eq!(usage["usage"][0]["gateway"], "good");
+    assert!(text(&out.stderr).contains("gateway 'bad'"));
+}
+
+#[test]
+fn json_mode_keeps_stdout_clean_while_waiting_on_a_rate_limit() {
+    let env = Env::new();
+    let mock = rate_limit_mock(Reply::rate_limited(&[("Retry-After", "1")]));
+    env.add_litellm("lite", &mock, "good-key", &[]);
+    let out = env.run(&["list-models", "--json"]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(json(&text(&out.stdout)).as_array().unwrap().len(), 2);
+    assert!(text(&out.stderr).contains("rate limited"));
+}
+
+#[test]
+fn table_output_is_unchanged_without_the_flag() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    env.add_litellm("lite", &mock, "good-key", &[]);
+    assert!(env.ok(&["list-models"]).starts_with("GATEWAY"));
+}

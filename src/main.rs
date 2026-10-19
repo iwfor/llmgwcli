@@ -32,6 +32,14 @@ struct GatewayArg {
     gateway: String,
 }
 
+/// How a query command prints its result.
+#[derive(Args)]
+struct OutputArg {
+    /// Print JSON instead of a table. Errors still go to stderr
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Add a gateway
@@ -82,6 +90,8 @@ enum Command {
     ListModels {
         #[command(flatten)]
         gateway: GatewayArg,
+        #[command(flatten)]
+        output: OutputArg,
         /// Case-insensitive substring match on the model id
         #[arg(long)]
         filter: Option<String>,
@@ -90,6 +100,8 @@ enum Command {
     Usage {
         #[command(flatten)]
         gateway: GatewayArg,
+        #[command(flatten)]
+        output: OutputArg,
     },
     /// Print a shell completion script
     Completions {
@@ -219,22 +231,30 @@ fn run(cli: Cli) -> Result<()> {
             store.save_config(&config)?;
             println!("Removed gateway '{name}'.");
         }
-        Command::ListModels { gateway, filter } => {
+        Command::ListModels { gateway, output, filter } => {
             let targets = targets(&store, &gateway.gateway)?;
             let (results, failed) = gather(&targets, |t| provider::list_models(&t.cfg, &t.api_key));
-            let rows = model_rows(results, filter.as_deref());
-            print_table(&["GATEWAY", "MODEL", "INPUT/1M", "OUTPUT/1M"], rows, 2);
+            if output.json {
+                print_json(&models_json(results, filter.as_deref()))?;
+            } else {
+                let rows = model_rows(results, filter.as_deref());
+                print_table(&["GATEWAY", "MODEL", "INPUT/1M", "OUTPUT/1M"], rows, 2);
+            }
             finish(failed)?;
         }
         Command::Completions { .. } => unreachable!("handled before the store opens"),
-        Command::Usage { gateway } => {
+        Command::Usage { gateway, output } => {
             let targets = targets(&store, &gateway.gateway)?;
             let (start, end) = current_month();
             let (results, failed) =
                 gather(&targets, |t| provider::usage(&t.cfg, &t.api_key, start, end));
-            let rows = results.into_iter().map(|(t, u)| usage_row(t, &u)).collect();
-            println!("Usage {start} to {end} (end exclusive, UTC)");
-            print_table(&["GATEWAY", "COST (USD)", "PROMPT TOK", "COMPLETION TOK", "REQUESTS"], rows, 1);
+            if output.json {
+                print_json(&usage_json(&results, start, end))?;
+            } else {
+                let rows = results.iter().map(|(t, u)| usage_row(t, u)).collect();
+                println!("Usage {start} to {end} (end exclusive, UTC)");
+                print_table(&["GATEWAY", "COST (USD)", "PROMPT TOK", "COMPLETION TOK", "REQUESTS"], rows, 1);
+            }
             finish(failed)?;
         }
     }
@@ -313,16 +333,64 @@ fn or_dash<T>(value: Option<T>, show: impl Fn(T) -> String) -> String {
     value.map_or_else(|| "-".to_string(), show)
 }
 
-/// One row per model whose id contains `filter` (case-insensitive).
-fn model_rows(results: Vec<(&Target, Vec<Model>)>, filter: Option<&str>) -> Vec<Vec<String>> {
+/// Every model whose id contains `filter` (case-insensitive), with its gateway.
+fn filter_models<'a>(results: Vec<(&'a Target, Vec<Model>)>, filter: Option<&str>) -> Vec<(&'a Target, Model)> {
     let filter = filter.map(str::to_lowercase);
-    let price = |p: Option<f64>| or_dash(p, |p| format!("{p:.4}"));
     results
         .into_iter()
         .flat_map(|(t, models)| models.into_iter().map(move |m| (t, m)))
         .filter(|(_, m)| filter.as_ref().is_none_or(|f| m.id.to_lowercase().contains(f)))
+        .collect()
+}
+
+fn model_rows(results: Vec<(&Target, Vec<Model>)>, filter: Option<&str>) -> Vec<Vec<String>> {
+    let price = |p: Option<f64>| or_dash(p, |p| format!("{p:.4}"));
+    filter_models(results, filter)
+        .into_iter()
         .map(|(t, m)| vec![t.name.clone(), m.id, price(m.input_price), price(m.output_price)])
         .collect()
+}
+
+/// Prices are USD per 1M tokens; rounded to drop floating point noise from
+/// converting per-token prices.
+fn round_price(price: f64) -> f64 {
+    (price * 1e6).round() / 1e6
+}
+
+fn models_json(results: Vec<(&Target, Vec<Model>)>, filter: Option<&str>) -> serde_json::Value {
+    filter_models(results, filter)
+        .into_iter()
+        .map(|(t, m)| {
+            serde_json::json!({
+                "gateway": t.name,
+                "model": m.id,
+                "input_per_million": m.input_price.map(round_price),
+                "output_per_million": m.output_price.map(round_price),
+            })
+        })
+        .collect()
+}
+
+/// Unknown values are `null`.
+fn usage_json(results: &[(&Target, Usage)], start: NaiveDate, end: NaiveDate) -> serde_json::Value {
+    let usage: Vec<_> = results
+        .iter()
+        .map(|(t, u)| {
+            serde_json::json!({
+                "gateway": t.name,
+                "cost_usd": u.cost,
+                "prompt_tokens": u.prompt_tokens,
+                "completion_tokens": u.completion_tokens,
+                "requests": u.requests,
+            })
+        })
+        .collect();
+    serde_json::json!({ "start": start.to_string(), "end": end.to_string(), "usage": usage })
+}
+
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
 }
 
 fn usage_row(target: &Target, usage: &Usage) -> Vec<String> {
@@ -410,14 +478,14 @@ mod tests {
 
     #[test]
     fn gateway_defaults_to_all() {
-        let Command::Usage { gateway } = parse(&["usage"]).unwrap().command else { panic!() };
+        let Command::Usage { gateway, .. } = parse(&["usage"]).unwrap().command else { panic!() };
         assert_eq!(gateway.gateway, "all");
     }
 
     #[test]
     fn gateway_short_and_long_flags() {
         for args in [["usage", "-g", "fw"], ["usage", "--gateway", "fw"]] {
-            let Command::Usage { gateway } = parse(&args).unwrap().command else { panic!() };
+            let Command::Usage { gateway, .. } = parse(&args).unwrap().command else { panic!() };
             assert_eq!(gateway.gateway, "fw");
         }
     }
@@ -425,7 +493,7 @@ mod tests {
     #[test]
     fn list_models_takes_filter_and_gateway() {
         let cli = parse(&["list-models", "-g", "fw", "--filter", "llama"]).unwrap();
-        let Command::ListModels { gateway, filter } = cli.command else { panic!() };
+        let Command::ListModels { gateway, filter, .. } = cli.command else { panic!() };
         assert_eq!(gateway.gateway, "fw");
         assert_eq!(filter.as_deref(), Some("llama"));
     }
@@ -667,5 +735,79 @@ mod tests {
         store.remove_api_key("lite", CredentialStore::File).unwrap();
         let err = targets(&store, "lite").err().unwrap();
         assert!(err.to_string().contains("no API key for 'lite'"));
+    }
+    // --- --json output ---
+
+    #[test]
+    fn json_flag_defaults_to_off_and_can_be_set() {
+        let Command::Usage { output, .. } = parse(&["usage"]).unwrap().command else { panic!() };
+        assert!(!output.json);
+        let Command::Usage { output, .. } = parse(&["usage", "--json"]).unwrap().command else { panic!() };
+        assert!(output.json);
+        let Command::ListModels { output, .. } =
+            parse(&["list-models", "--json", "-g", "fw"]).unwrap().command else { panic!() };
+        assert!(output.json);
+    }
+
+    #[test]
+    fn models_json_has_one_object_per_model_with_null_for_unknown_prices() {
+        let t = target("fw");
+        let results = vec![(&t, vec![model("a", Some(0.9), Some(1.8)), model("b", None, None)])];
+        assert_eq!(
+            models_json(results, None),
+            serde_json::json!([
+                {"gateway": "fw", "model": "a", "input_per_million": 0.9, "output_per_million": 1.8},
+                {"gateway": "fw", "model": "b", "input_per_million": null, "output_per_million": null},
+            ])
+        );
+    }
+
+    #[test]
+    fn models_json_applies_the_filter() {
+        let t = target("fw");
+        let results = vec![(&t, vec![model("Llama", None, None), model("mixtral", None, None)])];
+        let json = models_json(results, Some("llama"));
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["model"], "Llama");
+    }
+
+    #[test]
+    fn models_json_is_an_empty_array_when_nothing_matches() {
+        let t = target("fw");
+        assert_eq!(models_json(vec![(&t, vec![model("x", None, None)])], Some("zzz")), serde_json::json!([]));
+        assert_eq!(models_json(vec![], None), serde_json::json!([]));
+    }
+
+    #[test]
+    fn models_json_prices_have_no_floating_point_noise() {
+        let t = target("fw");
+        // 0.0000009 USD per token * 1e6 is 0.8999999999999999 in floating point.
+        let price = 0.0000009_f64 * 1e6;
+        let json = models_json(vec![(&t, vec![model("a", Some(price), None)])], None);
+        assert_eq!(json[0]["input_per_million"], 0.9);
+    }
+
+    #[test]
+    fn usage_json_has_the_period_and_one_object_per_gateway() {
+        let (a, b) = (target("a"), target("b"));
+        let full = Usage { cost: Some(12.5), prompt_tokens: Some(10), completion_tokens: Some(5), requests: Some(2) };
+        let results = vec![(&a, full), (&b, Usage::default())];
+        assert_eq!(
+            usage_json(&results, date(2026, 10, 1), date(2026, 11, 1)),
+            serde_json::json!({
+                "start": "2026-10-01",
+                "end": "2026-11-01",
+                "usage": [
+                    {"gateway": "a", "cost_usd": 12.5, "prompt_tokens": 10, "completion_tokens": 5, "requests": 2},
+                    {"gateway": "b", "cost_usd": null, "prompt_tokens": null, "completion_tokens": null, "requests": null},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn usage_json_with_no_results_has_an_empty_list() {
+        let json = usage_json(&[], date(2026, 10, 1), date(2026, 11, 1));
+        assert_eq!(json["usage"], serde_json::json!([]));
     }
 }
