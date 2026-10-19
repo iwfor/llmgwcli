@@ -175,3 +175,195 @@ fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn open() -> (TempDir, Store) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path().join("cfg")).unwrap();
+        (tmp, store)
+    }
+
+    fn gateway(alias: Option<&str>) -> ProviderConfig {
+        ProviderConfig {
+            kind: ProviderKind::Litellm,
+            base_url: "http://localhost:4000".into(),
+            alias: alias.map(String::from),
+            account_id: None,
+        }
+    }
+
+    fn config() -> Config {
+        let mut config = Config::default();
+        config.providers.insert("lite".into(), gateway(Some("ll")));
+        config.providers.insert("other".into(), gateway(None));
+        config
+    }
+
+    #[test]
+    fn open_creates_private_dir_and_key() {
+        let (tmp, store) = open();
+        let dir = tmp.path().join("cfg");
+        assert_eq!(mode(&dir), 0o700);
+        let key = fs::read_to_string(dir.join("llmgwcli.key")).unwrap();
+        assert_eq!(key.len(), 32);
+        assert!(key.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_eq!(mode(&dir.join("llmgwcli.key")), 0o600);
+        assert_eq!(store.key().unwrap(), key);
+    }
+
+    #[test]
+    fn open_keeps_existing_key() {
+        let (tmp, store) = open();
+        let first = store.key().unwrap();
+        let again = Store::open(tmp.path().join("cfg")).unwrap();
+        assert_eq!(again.key().unwrap(), first);
+    }
+
+    #[test]
+    fn open_tightens_loose_permissions() {
+        let (tmp, _store) = open();
+        let dir = tmp.path().join("cfg");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(dir.join("llmgwcli.key"), fs::Permissions::from_mode(0o644)).unwrap();
+        Store::open(dir.clone()).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("llmgwcli.key")), 0o600);
+    }
+
+    #[test]
+    fn bad_key_length_is_rejected() {
+        let (tmp, store) = open();
+        fs::write(tmp.path().join("cfg/llmgwcli.key"), "short").unwrap();
+        assert!(store.key().is_err());
+    }
+
+    #[test]
+    fn missing_config_is_empty() {
+        let (_tmp, store) = open();
+        assert!(store.load_config().unwrap().providers.is_empty());
+    }
+
+    #[test]
+    fn config_round_trips_and_is_private() {
+        let (tmp, store) = open();
+        store.save_config(&config()).unwrap();
+        let loaded = store.load_config().unwrap();
+        assert_eq!(loaded.providers.len(), 2);
+        assert_eq!(loaded.providers["lite"].alias.as_deref(), Some("ll"));
+        assert_eq!(loaded.providers["lite"].kind, ProviderKind::Litellm);
+        assert_eq!(mode(&tmp.path().join("cfg/config.toml")), 0o600);
+    }
+
+    #[test]
+    fn config_omits_unset_optional_fields() {
+        let (tmp, store) = open();
+        store.save_config(&config()).unwrap();
+        let text = fs::read_to_string(tmp.path().join("cfg/config.toml")).unwrap();
+        assert!(text.contains("type = \"litellm\""));
+        assert!(!text.contains("account_id"));
+    }
+
+    #[test]
+    fn invalid_config_reports_the_file() {
+        let (tmp, store) = open();
+        fs::write(tmp.path().join("cfg/config.toml"), "providers = [").unwrap();
+        let err = store.load_config().unwrap_err();
+        assert!(format!("{err:#}").contains("config.toml"));
+    }
+
+    #[test]
+    fn api_key_is_encrypted_and_round_trips() {
+        let (tmp, store) = open();
+        store.set_api_key("lite", "sk-plain-secret").unwrap();
+        assert_eq!(store.api_key("lite").unwrap().as_deref(), Some("sk-plain-secret"));
+        let text = fs::read_to_string(tmp.path().join("cfg/credentials.toml")).unwrap();
+        assert!(!text.contains("sk-plain-secret"));
+        assert_eq!(mode(&tmp.path().join("cfg/credentials.toml")), 0o600);
+    }
+
+    #[test]
+    fn api_key_missing_is_none() {
+        let (_tmp, store) = open();
+        assert_eq!(store.api_key("nope").unwrap(), None);
+    }
+
+    #[test]
+    fn set_api_key_replaces_and_keeps_others() {
+        let (_tmp, store) = open();
+        store.set_api_key("a", "one").unwrap();
+        store.set_api_key("b", "two").unwrap();
+        store.set_api_key("a", "three").unwrap();
+        assert_eq!(store.api_key("a").unwrap().as_deref(), Some("three"));
+        assert_eq!(store.api_key("b").unwrap().as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn remove_api_key_only_removes_that_gateway() {
+        let (_tmp, store) = open();
+        store.set_api_key("a", "one").unwrap();
+        store.set_api_key("b", "two").unwrap();
+        store.remove_api_key("a").unwrap();
+        assert_eq!(store.api_key("a").unwrap(), None);
+        assert_eq!(store.api_key("b").unwrap().as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn api_key_fails_with_a_different_key_file() {
+        let (tmp, store) = open();
+        store.set_api_key("a", "one").unwrap();
+        fs::write(tmp.path().join("cfg/llmgwcli.key"), "A".repeat(32)).unwrap();
+        assert!(store.api_key("a").is_err());
+    }
+
+    #[test]
+    fn resolve_accepts_name_or_alias() {
+        let config = config();
+        assert_eq!(config.resolve("lite").unwrap(), "lite");
+        assert_eq!(config.resolve("ll").unwrap(), "lite");
+        assert!(config.resolve("nope").unwrap_err().to_string().contains("unknown gateway 'nope'"));
+    }
+
+    #[test]
+    fn select_all_returns_every_gateway_sorted() {
+        assert_eq!(config().select("all").unwrap(), ["lite", "other"]);
+    }
+
+    #[test]
+    fn select_single_gateway_by_alias() {
+        assert_eq!(config().select("ll").unwrap(), ["lite"]);
+    }
+
+    #[test]
+    fn select_all_with_no_gateways_fails() {
+        assert!(Config::default().select("all").is_err());
+    }
+
+    #[test]
+    fn select_unknown_fails() {
+        assert!(config().select("nope").is_err());
+    }
+
+    #[test]
+    fn ensure_free_rejects_reserved_and_taken() {
+        let config = config();
+        assert!(config.ensure_free("all", None).is_err());
+        assert!(config.ensure_free("lite", None).is_err());
+        assert!(config.ensure_free("ll", None).is_err());
+        assert!(config.ensure_free("fresh", None).is_ok());
+    }
+
+    #[test]
+    fn ensure_free_ignores_the_excepted_gateway() {
+        let config = config();
+        assert!(config.ensure_free("ll", Some("lite")).is_ok());
+        assert!(config.ensure_free("ll", Some("other")).is_err());
+    }
+}

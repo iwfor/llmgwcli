@@ -4,6 +4,7 @@
 - Keep all project memories in this file (CLAUDE.md).
 - Keep responses concise and in simple English.
 - The project is written in Rust.
+- Follow TDD from now on: write a failing test first, then the code to pass it, then refactor. Everything must be tested; no code change without a test. Run `cargo test` before every commit.
 
 ## Overview
 `llmgwcli` is a CLI client for LLM gateways. Supported: LiteLLM and fireworks.ai.
@@ -32,6 +33,13 @@ Commands keep the `*-provider` names; "gateway" is the user-facing word.
 - `src/store.rs`: config/credentials/key files and permissions
 - `src/crypto.rs`: encrypt/decrypt
 - `src/provider.rs`: provider kinds and model listing
+
+## Testing
+- Unit tests live in `#[cfg(test)]` modules in each `src/*.rs` file; end-to-end tests are in `tests/cli.rs`.
+- `tests/cli.rs` runs the real binary with `--config-dir` set to a temp dir and a mock HTTP gateway (`Mock`) on 127.0.0.1. No real network or real keys are used.
+- Keep pure logic separate from I/O so it can be unit tested (e.g. `parse_*` in `provider.rs`, `month_window`, `format_table`, `model_rows`).
+- Table tests check structure (cell order, alignment), not exact spacing, so tweaking column gaps does not break them.
+- Not tested: the interactive API-key prompt (needs a TTY) and real gateway responses (only mocks are used).
 
 ## Provider notes
 - LiteLLM: needs `--base-url`. Models: `GET /model/info` (prices), falls back to `/v1/models` (no prices). Usage: `GET /user/daily/activity?start_date&end_date`, reads `metadata.total_*` (tested only against a mock; docs do not say if `end_date` is inclusive).

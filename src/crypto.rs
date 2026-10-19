@@ -58,4 +58,36 @@ mod tests {
         let enc = encrypt(KEY, "sk-secret").unwrap();
         assert!(decrypt("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", &enc).is_err());
     }
+
+    #[test]
+    fn same_text_encrypts_differently_each_time() {
+        assert_ne!(encrypt(KEY, "x").unwrap(), encrypt(KEY, "x").unwrap());
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails() {
+        let mut data = STANDARD.decode(encrypt(KEY, "sk-secret").unwrap()).unwrap();
+        let last = data.len() - 1;
+        data[last] ^= 1;
+        assert!(decrypt(KEY, &STANDARD.encode(data)).is_err());
+    }
+
+    #[test]
+    fn short_or_invalid_input_fails() {
+        assert!(decrypt(KEY, &STANDARD.encode([0u8; 5])).is_err());
+        assert!(decrypt(KEY, "not base64!").is_err());
+    }
+
+    #[test]
+    fn wrong_key_length_fails() {
+        assert!(encrypt("short", "x").is_err());
+        assert!(decrypt("short", "x").is_err());
+    }
+
+    #[test]
+    fn empty_and_unicode_text_round_trip() {
+        for text in ["", "héllo ✓"] {
+            assert_eq!(decrypt(KEY, &encrypt(KEY, text).unwrap()).unwrap(), text);
+        }
+    }
 }
