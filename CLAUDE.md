@@ -54,3 +54,9 @@ Commands keep the `*-provider` names; "gateway" is the user-facing word.
 
 ## License
 - BSD 2-Clause, copyright 2026 Isaac Foraker (`LICENSE`; also set in `Cargo.toml`).
+
+## Rate limits (HTTP 429)
+- All GETs go through `get_json` in `provider.rs`. On a 429 it waits as long as the response says, then retries (max 5 retries).
+- Wait comes from `Retry-After` (seconds, fractional seconds, or HTTP date), else `retry-after-ms`, else backs off 1s, 2s, 4s, 8s, 16s.
+- If the wait is over 300s (`MAX_WAIT`) it fails at once with "the service asked us to wait Ns, which exceeds our 300s timeout"; it does not wait or retry. The error is a `RateLimitError`, and the LiteLLM `/model/info` -> `/models` fallback does not hide it.
+- Each wait prints `rate limited (429) by URL; waiting Ns (retry k/5)` on stderr. With `-g all`, gateways wait independently.

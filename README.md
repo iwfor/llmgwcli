@@ -31,6 +31,10 @@ source <(llmgwcli completions)
 
 `-g/--gateway` takes a gateway name or alias. The default, `all`, queries every gateway in parallel.
 
+## Rate limits
+
+If a gateway answers 429 (too many requests), llmgwcli waits as long as the response's `Retry-After` header says and retries, up to 5 times. If the gateway asks for more than 300 seconds, it stops and reports an error instead of waiting.
+
 ## Configuration
 
 Files live in `~/.config/llmgwcli` (override with `--config-dir` or `LLMGWCLI_CONFIG_DIR`). The tool manages them; the directory and files are readable only by you.

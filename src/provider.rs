@@ -1,8 +1,12 @@
 //! Gateway providers: listing models and querying usage.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use clap::ValueEnum;
+use reqwest::StatusCode;
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -58,16 +62,93 @@ pub fn usage(cfg: &ProviderConfig, api_key: &str, start: NaiveDate, end: NaiveDa
     }
 }
 
+/// Longest rate-limit wait we accept; a longer one is reported as an error.
+const MAX_WAIT: Duration = Duration::from_secs(300);
+/// How many times one request is retried after a 429.
+const MAX_RETRIES: u32 = 5;
+
+/// The service is rate limiting us and we cannot or will not wait it out.
+#[derive(Debug)]
+pub struct RateLimitError(String);
+
+impl std::fmt::Display for RateLimitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RateLimitError {}
+
+/// GETs JSON. On a 429, waits as long as the response asks, then retries.
 fn get_json(url: &str, api_key: &str, query: &[(&str, &str)]) -> Result<Value> {
-    reqwest::blocking::Client::new()
-        .get(url)
-        .bearer_auth(api_key)
-        .query(query)
-        .send()
-        .and_then(|r| r.error_for_status())
+    let client = reqwest::blocking::Client::new();
+    let mut retries = 0;
+    let response = loop {
+        let response = client
+            .get(url)
+            .bearer_auth(api_key)
+            .query(query)
+            .send()
+            .with_context(|| format!("GET {url}"))?;
+        if response.status() != StatusCode::TOO_MANY_REQUESTS {
+            break response;
+        }
+        let wait = retry_delay(retries, response.headers(), Utc::now())
+            .with_context(|| format!("GET {url}: rate limited (429)"))?;
+        eprintln!(
+            "rate limited (429) by {}; waiting {}s (retry {}/{MAX_RETRIES})",
+            url.split('?').next().unwrap_or(url),
+            fmt_secs(wait.as_secs_f64()),
+            retries + 1
+        );
+        std::thread::sleep(wait);
+        retries += 1;
+    };
+    response
+        .error_for_status()
         .with_context(|| format!("GET {url}"))?
         .json()
         .with_context(|| format!("parsing response from {url}"))
+}
+
+/// How long to wait before retry number `retries` (0-based) after a 429.
+/// Uses the service's Retry-After (seconds or HTTP date) or retry-after-ms,
+/// else backs off 1s, 2s, 4s... Errors if the wait is over `MAX_WAIT` or
+/// the retries are used up.
+fn retry_delay(retries: u32, headers: &HeaderMap, now: DateTime<Utc>) -> Result<Duration> {
+    let secs = requested_wait_secs(headers, now).unwrap_or_else(|| f64::from(1u32 << retries.min(16)));
+    if secs > MAX_WAIT.as_secs_f64() {
+        return Err(RateLimitError(format!(
+            "the service asked us to wait {}s, which exceeds our {}s timeout",
+            fmt_secs(secs),
+            MAX_WAIT.as_secs()
+        ))
+        .into());
+    }
+    if retries >= MAX_RETRIES {
+        return Err(RateLimitError(format!("still rate limited (429) after {MAX_RETRIES} retries")).into());
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
+/// The wait the service asked for, in seconds, if it gave a usable one.
+fn requested_wait_secs(headers: &HeaderMap, now: DateTime<Utc>) -> Option<f64> {
+    let header = |name: &str| headers.get(name)?.to_str().ok().map(str::trim);
+    let non_negative = |n: f64| (n.is_finite() && n >= 0.0).then_some(n);
+    header("retry-after")
+        .and_then(|v| match v.parse::<f64>() {
+            Ok(secs) => non_negative(secs),
+            Err(_) => DateTime::parse_from_rfc2822(v)
+                .ok()
+                .map(|at| (at.with_timezone(&Utc) - now).num_milliseconds().max(0) as f64 / 1000.0),
+        })
+        .or_else(|| header("retry-after-ms")?.parse::<f64>().ok().and_then(non_negative).map(|ms| ms / 1000.0))
+}
+
+/// "12" or "1.5": no trailing ".0".
+fn fmt_secs(secs: f64) -> String {
+    let text = format!("{secs:.1}");
+    text.strip_suffix(".0").unwrap_or(&text).to_string()
 }
 
 fn data_items(value: &Value) -> impl Iterator<Item = &Value> {
@@ -78,6 +159,8 @@ fn data_items(value: &Value) -> impl Iterator<Item = &Value> {
 fn litellm_models(base: &str, api_key: &str) -> Result<Vec<Model>> {
     match get_json(&format!("{base}/model/info"), api_key, &[]) {
         Ok(info) => Ok(parse_litellm_models(&info)),
+        // Rate limiting is not a reason to try another endpoint.
+        Err(e) if e.is::<RateLimitError>() => Err(e),
         Err(_) => Ok(parse_openai_models(&get_json(&format!("{base}/models"), api_key, &[])?, |_| (None, None))),
     }
 }
@@ -326,5 +409,92 @@ mod tests {
         let day = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
         let err = fireworks_usage(&cfg, "k", day, day).unwrap_err();
         assert!(err.to_string().contains("account id"));
+    }
+    // --- rate limiting ---
+
+    use chrono::{TimeZone, Utc};
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, HeaderValue::from_static(value));
+        }
+        map
+    }
+
+    fn now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 19, 12, 0, 0).unwrap()
+    }
+
+    fn wait(retries: u32, pairs: &[(&'static str, &'static str)]) -> Result<Duration> {
+        retry_delay(retries, &headers(pairs), now())
+    }
+
+    #[test]
+    fn retry_after_seconds_is_honoured_exactly() {
+        assert_eq!(wait(0, &[("retry-after", "7")]).unwrap(), Duration::from_secs(7));
+        assert_eq!(wait(0, &[("retry-after", "0")]).unwrap(), Duration::ZERO);
+        assert_eq!(wait(0, &[("retry-after", " 12 ")]).unwrap(), Duration::from_secs(12));
+    }
+
+    #[test]
+    fn retry_after_may_be_fractional() {
+        assert_eq!(wait(0, &[("retry-after", "1.5")]).unwrap(), Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn retry_after_http_date_is_relative_to_now() {
+        let at = wait(0, &[("retry-after", "Mon, 19 Oct 2026 12:00:10 GMT")]);
+        assert_eq!(at.unwrap(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn retry_after_date_in_the_past_means_no_wait() {
+        let at = wait(0, &[("retry-after", "Mon, 19 Oct 2026 11:00:00 GMT")]);
+        assert_eq!(at.unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn retry_after_ms_is_used_when_retry_after_is_missing() {
+        assert_eq!(wait(0, &[("retry-after-ms", "2500")]).unwrap(), Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn retry_after_wins_over_retry_after_ms() {
+        let both = [("retry-after", "3"), ("retry-after-ms", "9000")];
+        assert_eq!(wait(0, &both).unwrap(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn exactly_the_maximum_wait_is_allowed() {
+        assert_eq!(wait(0, &[("retry-after", "300")]).unwrap(), MAX_WAIT);
+    }
+
+    #[test]
+    fn wait_over_the_maximum_is_an_error_that_says_so() {
+        for value in ["301", "300.5", "99999999999999999999"] {
+            let err = wait(0, &[("retry-after", value)]).unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains("exceeds") && text.contains("300s timeout"), "{value}: {text}");
+            assert!(err.is::<RateLimitError>());
+        }
+        assert!(wait(0, &[("retry-after", "Tue, 20 Oct 2026 12:00:00 GMT")]).is_err());
+        assert!(wait(0, &[("retry-after-ms", "300001")]).is_err());
+    }
+
+    #[test]
+    fn missing_or_unusable_headers_back_off_exponentially() {
+        for headers in [&[][..], &[("retry-after", "soon")], &[("retry-after", "-5")], &[("retry-after", "inf")]] {
+            let waits: Vec<_> = (0..MAX_RETRIES).map(|n| wait(n, headers).unwrap().as_secs()).collect();
+            assert_eq!(waits, [1, 2, 4, 8, 16], "{headers:?}");
+        }
+    }
+
+    #[test]
+    fn gives_up_after_the_maximum_number_of_retries() {
+        let err = wait(MAX_RETRIES, &[("retry-after", "1")]).unwrap_err();
+        assert!(err.to_string().contains("after 5 retries"), "{err}");
+        assert!(err.is::<RateLimitError>());
     }
 }

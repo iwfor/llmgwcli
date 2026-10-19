@@ -17,6 +17,24 @@ const LITELLM_USAGE: &str = r#"{"metadata": {"total_spend": 12.3456,
 const FIREWORKS_SUMMARY: &str = r#"{"lineItems": [{"totalCost": "1.5"}, {"totalCost": "0.25"}]}"#;
 const FIREWORKS_TOKENS: &str = r#"{"rows": [{"promptTokens": "300", "completionTokens": "30"}]}"#;
 
+/// One canned HTTP response.
+#[derive(Clone)]
+struct Reply {
+    status: &'static str,
+    headers: Vec<(&'static str, &'static str)>,
+    body: &'static str,
+}
+
+impl Reply {
+    fn ok(body: &'static str) -> Reply {
+        Reply { status: "200 OK", headers: vec![], body }
+    }
+
+    fn rate_limited(headers: &[(&'static str, &'static str)]) -> Reply {
+        Reply { status: "429 Too Many Requests", headers: headers.to_vec(), body: "{}" }
+    }
+}
+
 /// A tiny HTTP server. `routes` map a path fragment to a JSON body.
 /// Requests without `Authorization: Bearer good-key` get a 401.
 struct Mock {
@@ -26,12 +44,20 @@ struct Mock {
 
 impl Mock {
     fn start(routes: &[(&'static str, &'static str)]) -> Mock {
+        let replies: Vec<_> = routes.iter().map(|(path, body)| (*path, vec![Reply::ok(body)])).collect();
+        Mock::start_replies(&replies)
+    }
+
+    /// Like `start`, but each path gets a list of replies served in order;
+    /// the last one repeats.
+    fn start_replies(routes: &[(&'static str, Vec<Reply>)]) -> Mock {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&requests);
         let routes = routes.to_vec();
         thread::spawn(move || {
+            let mut served = vec![0usize; routes.len()];
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -48,18 +74,26 @@ impl Mock {
                 }
                 let path = request_line.split(' ').nth(1).unwrap_or("").to_string();
                 log.lock().unwrap().push(path.clone());
-                let (status, body) = if !authorized {
-                    ("401 Unauthorized", "{}")
+                let reply = if !authorized {
+                    Reply { status: "401 Unauthorized", headers: vec![], body: "{}" }
                 } else {
-                    match routes.iter().find(|(fragment, _)| path.contains(fragment)) {
-                        Some((_, body)) => ("200 OK", *body),
-                        None => ("404 Not Found", "{}"),
+                    match routes.iter().position(|(fragment, _)| path.contains(fragment)) {
+                        Some(i) => {
+                            let replies = &routes[i].1;
+                            let reply = replies[served[i].min(replies.len() - 1)].clone();
+                            served[i] += 1;
+                            reply
+                        }
+                        None => Reply { status: "404 Not Found", headers: vec![], body: "{}" },
                     }
                 };
+                let extra: String = reply.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    reply.status,
+                    reply.body.len(),
+                    reply.body
                 );
             }
         });
@@ -566,4 +600,77 @@ fn missing_security_command_gives_a_clear_error() {
         .unwrap();
     assert!(!out.status.success());
     assert!(text(&out.stderr).contains("running /nonexistent/security"), "{}", text(&out.stderr));
+}
+
+// --- rate limiting (429) ---
+
+fn rate_limit_mock(first: Reply) -> Mock {
+    Mock::start_replies(&[("/model/info", vec![first, Reply::ok(LITELLM_MODELS)])])
+}
+
+#[test]
+fn waits_for_retry_after_then_succeeds() {
+    let env = Env::new();
+    let mock = rate_limit_mock(Reply::rate_limited(&[("Retry-After", "1")]));
+    env.add_litellm("lite", &mock, "good-key", &["--credential-store", "file"]);
+    let started = std::time::Instant::now();
+    let out = env.run(&["list-models"]);
+    let waited = started.elapsed();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("llama-70b"));
+    assert!(waited >= std::time::Duration::from_secs(1), "only waited {waited:?}");
+    assert!(text(&out.stderr).contains("rate limited"), "{}", text(&out.stderr));
+    assert_eq!(mock.requests().len(), 2, "{:?}", mock.requests());
+}
+
+#[test]
+fn rate_limit_without_a_header_backs_off_and_retries() {
+    let env = Env::new();
+    let mock = rate_limit_mock(Reply::rate_limited(&[]));
+    env.add_litellm("lite", &mock, "good-key", &["--credential-store", "file"]);
+    let started = std::time::Instant::now();
+    assert!(env.ok(&["list-models"]).contains("llama-70b"));
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn wait_longer_than_300_seconds_fails_at_once_without_retrying() {
+    let env = Env::new();
+    let mock = rate_limit_mock(Reply::rate_limited(&[("Retry-After", "301")]));
+    env.add_litellm("lite", &mock, "good-key", &["--credential-store", "file"]);
+    let started = std::time::Instant::now();
+    let err = env.fails(&["list-models"]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "should not wait");
+    assert!(err.contains("301s") && err.contains("exceeds our 300s timeout"), "{err}");
+    assert!(err.contains("gateway 'lite'"), "{err}");
+    // No retry, and no silent fallback to /models either.
+    assert_eq!(mock.requests().len(), 1, "{:?}", mock.requests());
+}
+
+#[test]
+fn usage_also_honours_rate_limits() {
+    let env = Env::new();
+    let mock = Mock::start_replies(&[(
+        "/user/daily/activity",
+        vec![Reply::rate_limited(&[("Retry-After", "1")]), Reply::ok(LITELLM_USAGE)],
+    )]);
+    env.add_litellm("lite", &mock, "good-key", &["--credential-store", "file"]);
+    assert!(env.ok(&["usage"]).contains("12.3456"));
+    assert_eq!(mock.requests().len(), 2);
+}
+
+#[test]
+fn one_rate_limited_gateway_does_not_block_the_others() {
+    let env = Env::new();
+    let slow = Mock::start_replies(&[(
+        "/user/daily/activity",
+        vec![Reply::rate_limited(&[("Retry-After", "301")])],
+    )]);
+    let fast = Mock::start(&[("/user/daily/activity", LITELLM_USAGE)]);
+    env.add_litellm("slow", &slow, "good-key", &["--credential-store", "file"]);
+    env.add_litellm("fast", &fast, "good-key", &["--credential-store", "file"]);
+    let out = env.run(&["usage"]);
+    assert!(!out.status.success());
+    assert!(text(&out.stdout).contains("fast") && text(&out.stdout).contains("12.3456"));
+    assert!(text(&out.stderr).contains("gateway 'slow'") && text(&out.stderr).contains("exceeds"));
 }
