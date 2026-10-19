@@ -56,6 +56,8 @@ Pick one with `--credential-store keychain|file` on `add-provider`. Move an exis
 
 If you use the `file` store, keep `llmgwcli.key` safe. Without it, stored API keys cannot be decrypted.
 
+See [doc/config.md](doc/config.md) for details on the files. They are meant to be managed through the commands above, not edited by hand.
+
 ## Status
 
 Fireworks model prices and Fireworks usage parsing are not yet verified against the real API.

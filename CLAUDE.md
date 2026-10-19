@@ -19,6 +19,7 @@
 - Test hook: `LLMGWCLI_SECURITY_BIN` replaces the `security` program (tests use `tests/fake_security.sh`; the e2e tests always set it so they never touch the real keychain).
 - `config.toml`: all other settings (`[providers.<name>]` with `type` and `base_url`).
 - Format is TOML.
+- Documented for users in `doc/config.md`. Keep it in sync when config fields or file formats change. It must keep the notice that config is managed from the command line, not edited by hand.
 
 ## Commands
 Commands keep the `*-provider` names; "gateway" is the user-facing word.
