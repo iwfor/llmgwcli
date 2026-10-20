@@ -28,6 +28,7 @@ Commands keep the `*-provider` names; "gateway" is the user-facing word.
 - `remove-provider <name|alias>`
 - `list-models [-g GATEWAY] [--filter TEXT] [--json]`: price per 1M tokens; filter is a case-insensitive substring on model id.
 - `usage [-g GATEWAY] [--json]`: current month (UTC, 1st to 1st of next month) cost and tokens.
+- `-v/--verbose` (global): `verbose: ...` lines on stderr only (stdout stays clean): config dir, each gateway (type, URL, credential store), and each HTTP request with status and time. Never log API keys; URLs are redacted with `verbose::redact` so credentials embedded in a base URL do not show up (also in error messages). Log with the `vlog!` macro. `-V` is `--version`.
 - `--json` (list-models, usage): stdout is only JSON; errors and rate-limit notices stay on stderr and the exit code is unchanged. list-models prints an array of `{gateway, model, input_per_million, output_per_million}`; usage prints `{start, end, usage: [{gateway, cost_usd, prompt_tokens, completion_tokens, requests}]}`. Unknown values are `null` (tables show `-`). Prices are rounded to 6 decimals to drop float noise.
 - `completions [bash|zsh]`: prints a completion script (clap_complete); shell comes from `$SHELL` if omitted. Handled before the config dir is opened, so it creates no files. Completions are static (gateway names are not completed).
 - `-g/--gateway` takes a name or alias; default and special value `all` queries every gateway in parallel (threads). Failures print to stderr, other results still print, exit code 1.
@@ -38,6 +39,7 @@ Commands keep the `*-provider` names; "gateway" is the user-facing word.
 - `src/store.rs`: config/credentials/key files and permissions
 - `src/crypto.rs`: encrypt/decrypt
 - `src/keychain.rs`: macOS Keychain via the `security` command
+- `src/verbose.rs`: `-v` logging (`vlog!`) and URL redaction
 - `src/provider.rs`: provider kinds and model listing
 
 ## Testing

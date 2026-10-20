@@ -2,6 +2,7 @@ mod crypto;
 mod keychain;
 mod provider;
 mod store;
+mod verbose;
 
 use std::path::PathBuf;
 use std::thread;
@@ -13,6 +14,7 @@ use clap_complete::Shell;
 
 use provider::{Model, ProviderKind, Usage};
 use store::{ALL_GATEWAYS, Config, CredentialStore, ProviderConfig, Store};
+use verbose::{redact_str, vlog};
 
 #[derive(Parser)]
 #[command(version, about = "Client for LLM gateways")]
@@ -20,6 +22,9 @@ struct Cli {
     /// Config directory (default: ~/.config/llmgwcli)
     #[arg(long, global = true, env = "LLMGWCLI_CONFIG_DIR")]
     config_dir: Option<PathBuf>,
+    /// Explain what is happening on stderr (never shows API keys)
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -159,6 +164,8 @@ fn run(cli: Cli) -> Result<()> {
         None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
             .join(".config/llmgwcli"),
     };
+    verbose::set(cli.verbose);
+    vlog!("config dir: {}", dir.display());
     let store = Store::open(dir)?;
     match cli.command {
         Command::AddProvider { name, kind, alias, base_url, account_id, credential_store, api_key } => {
@@ -261,6 +268,11 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// A value's spelling on the command line, such as "litellm".
+fn value_name<T: ValueEnum>(value: &T) -> String {
+    value.to_possible_value().map(|v| v.get_name().to_string()).unwrap_or_default()
+}
+
 /// A gateway to query, with its decrypted API key.
 struct Target {
     name: String,
@@ -275,6 +287,12 @@ fn targets(store: &Store, gateway: &str) -> Result<Vec<Target>> {
         .into_iter()
         .map(|name| {
             let cfg = config.providers[&name].clone();
+            vlog!(
+                "gateway '{name}': {} at {}, API key from {}",
+                value_name(&cfg.kind),
+                redact_str(&cfg.base_url),
+                value_name(&cfg.credential_store)
+            );
             let api_key = store
                 .api_key(&name, cfg.credential_store)?
                 .with_context(|| format!("no API key for '{name}'"))?;
@@ -817,5 +835,28 @@ mod tests {
             assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
             assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")), "{err}");
         }
+    }
+    // --- -v/--verbose ---
+
+    #[test]
+    fn verbose_flag_short_long_and_after_the_subcommand() {
+        assert!(!parse(&["usage"]).unwrap().verbose);
+        for args in [&["-v", "usage"][..], &["--verbose", "usage"], &["usage", "-v"], &["list-models", "--verbose"]] {
+            assert!(parse(args).unwrap().verbose, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn lowercase_v_is_verbose_and_uppercase_v_is_version() {
+        let err = parse(&["-V"]).err().unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(parse(&["-v", "usage"]).is_ok());
+    }
+
+    #[test]
+    fn value_name_is_the_command_line_spelling() {
+        assert_eq!(value_name(&ProviderKind::Litellm), "litellm");
+        assert_eq!(value_name(&CredentialStore::Keychain), "keychain");
+        assert_eq!(value_name(&CredentialStore::File), "file");
     }
 }

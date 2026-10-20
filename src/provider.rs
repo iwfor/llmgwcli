@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::store::ProviderConfig;
+use crate::verbose::{redact_str, vlog};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -82,22 +83,28 @@ impl std::error::Error for RateLimitError {}
 /// GETs JSON. On a 429, waits as long as the response asks, then retries.
 fn get_json(url: &str, api_key: &str, query: &[(&str, &str)]) -> Result<Value> {
     let client = reqwest::blocking::Client::new();
+    // Errors and logs show the URL without any credentials embedded in it.
+    let shown = redact_str(url);
     let mut retries = 0;
     let response = loop {
-        let response = client
+        let request = client
             .get(url)
             .bearer_auth(api_key)
             .query(query)
-            .send()
-            .with_context(|| format!("GET {url}"))?;
+            .build()
+            .with_context(|| format!("GET {shown}"))?;
+        vlog!("GET {}", crate::verbose::redact(request.url()));
+        let started = std::time::Instant::now();
+        let response = client.execute(request).with_context(|| format!("GET {shown}"))?;
+        vlog!("-> {} in {}ms", response.status(), started.elapsed().as_millis());
         if response.status() != StatusCode::TOO_MANY_REQUESTS {
             break response;
         }
         let wait = retry_delay(retries, response.headers(), Utc::now())
-            .with_context(|| format!("GET {url}: rate limited (429)"))?;
+            .with_context(|| format!("GET {shown}: rate limited (429)"))?;
         eprintln!(
             "rate limited (429) by {}; waiting {}s (retry {}/{MAX_RETRIES})",
-            url.split('?').next().unwrap_or(url),
+            shown.split('?').next().unwrap_or(&shown),
             fmt_secs(wait.as_secs_f64()),
             retries + 1
         );
@@ -106,9 +113,9 @@ fn get_json(url: &str, api_key: &str, query: &[(&str, &str)]) -> Result<Value> {
     };
     response
         .error_for_status()
-        .with_context(|| format!("GET {url}"))?
+        .with_context(|| format!("GET {shown}"))?
         .json()
-        .with_context(|| format!("parsing response from {url}"))
+        .with_context(|| format!("parsing response from {shown}"))
 }
 
 /// How long to wait before retry number `retries` (0-based) after a 429.

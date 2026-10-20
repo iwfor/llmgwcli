@@ -28,6 +28,9 @@ llmgwcli usage -g all
 # JSON output for scripts (also works with list-models)
 llmgwcli usage --json | jq '.usage[] | {gateway, cost_usd}'
 
+# Show what is happening (config, gateways, HTTP requests; never API keys)
+llmgwcli -v usage
+
 # Show the version
 llmgwcli --version
 

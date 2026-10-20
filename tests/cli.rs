@@ -774,3 +774,107 @@ fn version_flag_needs_no_config_and_creates_none() {
     env.ok(&["--version"]);
     assert!(!env.dir().exists());
 }
+
+// --- -v/--verbose ---
+
+#[test]
+fn quiet_by_default() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    env.add_litellm("lite", &mock, "good-key", &[]);
+    let out = env.run(&["list-models"]);
+    assert!(out.status.success());
+    assert!(!text(&out.stderr).contains("verbose:"), "{}", text(&out.stderr));
+}
+
+#[test]
+fn verbose_logs_config_gateway_and_requests_on_stderr() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    env.add_litellm("lite", &mock, "good-key", &["--credential-store", "file"]);
+    let out = env.run(&["-v", "list-models"]);
+    assert!(out.status.success());
+    let err = text(&out.stderr);
+    assert!(err.contains(&format!("verbose: config dir: {}", env.dir().display())), "{err}");
+    assert!(err.contains("verbose: gateway 'lite': litellm at "), "{err}");
+    assert!(err.contains("API key from file"), "{err}");
+    assert!(err.contains(&format!("verbose: GET {}/model/info", mock.base)), "{err}");
+    assert!(err.contains("-> 200 OK in "), "{err}");
+    // stdout is still just the table
+    assert!(text(&out.stdout).starts_with("GATEWAY"));
+    assert!(!text(&out.stdout).contains("verbose:"));
+}
+
+#[test]
+fn verbose_names_the_keychain_store() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    env.add_litellm("lite", &mock, "good-key", &["--credential-store", "keychain"]);
+    let err = text(&env.run(&["list-models", "--verbose"]).stderr);
+    assert!(err.contains("API key from keychain"), "{err}");
+}
+
+#[test]
+fn verbose_never_prints_the_api_key() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    env.add_litellm("lite", &mock, "good-key", &[]);
+    for store in ["file", "keychain"] {
+        env.ok(&["edit-provider", "lite", "--credential-store", store]);
+        let out = env.run(&["-v", "list-models"]);
+        let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
+        assert!(!all.contains("good-key"), "key leaked with {store}: {all}");
+    }
+}
+
+#[test]
+fn verbose_shows_failed_requests_with_their_status() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    env.add_litellm("lite", &mock, "bad-key", &[]);
+    let out = env.run(&["usage", "-v"]);
+    assert!(!out.status.success());
+    assert!(text(&out.stderr).contains("-> 401 Unauthorized in "), "{}", text(&out.stderr));
+}
+
+#[test]
+fn verbose_json_keeps_stdout_valid() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/user/daily/activity", LITELLM_USAGE)]);
+    env.add_litellm("lite", &mock, "good-key", &[]);
+    let out = env.run(&["usage", "--json", "-v"]);
+    assert!(out.status.success());
+    assert_eq!(json(&text(&out.stdout))["usage"][0]["gateway"], "lite");
+    assert!(text(&out.stderr).contains("verbose: GET "));
+}
+
+#[test]
+fn verbose_logs_each_gateway_and_request_with_query() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/user/daily/activity", LITELLM_USAGE)]);
+    env.add_litellm("one", &mock, "good-key", &[]);
+    env.add_litellm("two", &mock, "good-key", &[]);
+    let err = text(&env.run(&["-v", "usage"]).stderr);
+    assert!(err.contains("gateway 'one'") && err.contains("gateway 'two'"), "{err}");
+    assert_eq!(err.matches("verbose: GET ").count(), 2, "{err}");
+    assert!(err.contains("start_date="), "{err}");
+}
+
+#[test]
+fn verbose_does_not_create_config_for_completions_or_version() {
+    let env = Env::new();
+    env.ok(&["-v", "--version"]);
+    env.ok(&["-v", "completions", "bash"]);
+    assert!(!env.dir().exists());
+}
+
+#[test]
+fn verbose_still_shows_rate_limit_waits() {
+    let env = Env::new();
+    let mock = rate_limit_mock(Reply::rate_limited(&[("Retry-After", "1")]));
+    env.add_litellm("lite", &mock, "good-key", &[]);
+    let err = text(&env.run(&["-v", "list-models"]).stderr);
+    assert!(err.contains("-> 429 Too Many Requests"), "{err}");
+    assert!(err.contains("rate limited (429)"), "{err}");
+    assert!(err.contains("-> 200 OK"), "{err}");
+}
