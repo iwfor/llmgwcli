@@ -51,7 +51,7 @@ pub fn list_models(cfg: &ProviderConfig, api_key: &str) -> Result<Vec<Model>> {
     let base = cfg.base_url.trim_end_matches('/');
     match cfg.kind {
         ProviderKind::Litellm => litellm_models(base, api_key),
-        ProviderKind::Fireworks => fireworks_models(base, api_key),
+        ProviderKind::Fireworks => fireworks_models(cfg, base, api_key),
     }
 }
 
@@ -186,27 +186,34 @@ fn parse_litellm_models(info: &Value) -> Vec<Model> {
         .collect()
 }
 
-/// Prices come from the account API (`/v1/serverless-models`), not the
-/// OpenAI-style `/models` list, which has none. If that call fails, fall back
-/// to the plain list so models still show (without prices).
-fn fireworks_models(base: &str, api_key: &str) -> Result<Vec<Model>> {
-    match fireworks_priced_models(fireworks_api_root(base), api_key) {
+/// Prices come from the account API (`/v1/accounts/{id}/serverlessModels`),
+/// not the OpenAI-style `/models` list, which has none. Without an account id,
+/// or if that call fails, fall back to the plain list (no prices).
+fn fireworks_models(cfg: &ProviderConfig, base: &str, api_key: &str) -> Result<Vec<Model>> {
+    let priced = match cfg.account_id.as_deref() {
+        Some(account) => fireworks_priced_models(&fireworks_models_url(base, account), api_key),
+        None => Err(anyhow::anyhow!("no account id")),
+    };
+    match priced {
         Ok(models) => Ok(models),
         // Rate limiting is not a reason to try another endpoint.
         Err(e) if e.is::<RateLimitError>() => Err(e),
         Err(e) => {
-            vlog!("serverless-models failed ({e:#}); listing models without prices");
+            vlog!("serverlessModels unavailable ({e:#}); listing models without prices");
             let list = get_json(&format!("{base}/models"), api_key, &[])?;
             Ok(parse_openai_models(&list, |_| (None, None)))
         }
     }
 }
 
+fn fireworks_models_url(base_url: &str, account: &str) -> String {
+    format!("{}/v1/accounts/{account}/serverlessModels", fireworks_api_root(base_url))
+}
+
 /// Safety stop for a server that keeps returning page tokens.
 const MAX_PAGES: usize = 100;
 
-fn fireworks_priced_models(root: &str, api_key: &str) -> Result<Vec<Model>> {
-    let url = format!("{root}/v1/serverless-models");
+fn fireworks_priced_models(url: &str, api_key: &str) -> Result<Vec<Model>> {
     let mut models = Vec::new();
     let mut token: Option<String> = None;
     for _ in 0..MAX_PAGES {
@@ -214,7 +221,7 @@ fn fireworks_priced_models(root: &str, api_key: &str) -> Result<Vec<Model>> {
         if let Some(t) = token.as_deref() {
             query.push(("pageToken", t));
         }
-        let page = get_json(&url, api_key, &query)?;
+        let page = get_json(url, api_key, &query)?;
         models.extend(parse_fireworks_models(&page));
         token = next_page_token(&page);
         if token.is_none() {
@@ -416,70 +423,78 @@ mod tests {
         assert!(parse_litellm_models(&json!({})).is_empty());
     }
 
-fn sku(name: &str, units: &str, nanos: u64, key: &str) -> Value {
-    json!({"sku": name, key: {"currencyCode": "USD", "units": units, "nanos": nanos}, "unit": "1M tokens"})
-}
+    fn sku(name: &str, units: &str, nanos: u64, key: &str) -> Value {
+        json!({"sku": name, key: {"currencyCode": "USD", "units": units, "nanos": nanos}, "unit": "1M tokens"})
+    }
 
-fn fw_model(name: &str, modes: Value) -> Value {
-    json!({"name": name, "serverlessModes": modes})
-}
+    fn fw_model(name: &str, modes: Value) -> Value {
+        json!({"name": name, "serverlessModes": modes})
+    }
 
-#[test]
-fn fireworks_models_read_sku_prices_per_million() {
-    let list = json!({"models": [fw_model("accounts/fireworks/models/a", json!([{
-        "serviceTier": "",
-        "skuInfos": [
-            sku("LLM input tokens (cached)", "0", 100_000_000, "amount"),
-            sku("LLM input tokens (uncached)", "0", 500_000_000, "amount"),
-            sku("LLM output tokens", "2", 250_000_000, "amount"),
-        ]}]))]});
-    let models = parse_fireworks_models(&list);
-    assert_eq!(models.len(), 1);
-    assert_eq!(models[0].id, "accounts/fireworks/models/a");
-    assert!(close(models[0].input_price, 0.5), "{:?}", models[0]);
-    assert!(close(models[0].output_price, 2.25), "{:?}", models[0]);
-}
+    #[test]
+    fn fireworks_models_read_sku_prices_per_million() {
+        let list = json!({"models": [fw_model("accounts/fireworks/models/a", json!([{
+            "serviceTier": "",
+            "skuInfos": [
+                sku("LLM input tokens (cached)", "0", 100_000_000, "amount"),
+                sku("LLM input tokens (uncached)", "0", 500_000_000, "amount"),
+                sku("LLM output tokens", "2", 250_000_000, "amount"),
+            ]}]))]});
+        let models = parse_fireworks_models(&list);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "accounts/fireworks/models/a");
+        assert!(close(models[0].input_price, 0.5), "{:?}", models[0]);
+        assert!(close(models[0].output_price, 2.25), "{:?}", models[0]);
+    }
 
-#[test]
-fn fireworks_models_accept_price_key_and_string_units() {
-    let list = json!({"models": [fw_model("m", json!([{
-        "skuInfos": [sku("LLM input tokens (uncached)", "1", 0, "price"), sku("LLM output tokens", "3", 0, "price")]}]))]});
-    let models = parse_fireworks_models(&list);
-    assert!(close(models[0].input_price, 1.0) && close(models[0].output_price, 3.0));
-}
+    #[test]
+    fn fireworks_models_accept_price_key_and_string_units() {
+        let list = json!({"models": [fw_model("m", json!([{
+            "skuInfos": [sku("LLM input tokens (uncached)", "1", 0, "price"), sku("LLM output tokens", "3", 0, "price")]}]))]});
+        let models = parse_fireworks_models(&list);
+        assert!(close(models[0].input_price, 1.0) && close(models[0].output_price, 3.0));
+    }
 
-#[test]
-fn fireworks_models_prefer_the_standard_mode() {
-    let list = json!({"models": [fw_model("m", json!([
-        {"serviceTier": "priority", "skuInfos": [sku("LLM output tokens", "9", 0, "amount")]},
-        {"serviceTier": "standard", "skuInfos": [sku("LLM output tokens", "3", 0, "amount")]},
-    ]))]});
-    assert!(close(parse_fireworks_models(&list)[0].output_price, 3.0));
-}
+    #[test]
+    fn fireworks_models_prefer_the_standard_mode() {
+        let list = json!({"models": [fw_model("m", json!([
+            {"serviceTier": "priority", "skuInfos": [sku("LLM output tokens", "9", 0, "amount")]},
+            {"serviceTier": "standard", "skuInfos": [sku("LLM output tokens", "3", 0, "amount")]},
+        ]))]});
+        assert!(close(parse_fireworks_models(&list)[0].output_price, 3.0));
+    }
 
-#[test]
-fn fireworks_models_use_first_mode_when_none_is_standard() {
-    let list = json!({"models": [fw_model("m", json!([
-        {"serviceTier": "fast", "skuInfos": [sku("LLM output tokens", "7", 0, "amount")]},
-        {"serviceTier": "priority", "skuInfos": [sku("LLM output tokens", "9", 0, "amount")]},
-    ]))]});
-    assert!(close(parse_fireworks_models(&list)[0].output_price, 7.0));
-}
+    #[test]
+    fn fireworks_models_use_first_mode_when_none_is_standard() {
+        let list = json!({"models": [fw_model("m", json!([
+            {"serviceTier": "fast", "skuInfos": [sku("LLM output tokens", "7", 0, "amount")]},
+            {"serviceTier": "priority", "skuInfos": [sku("LLM output tokens", "9", 0, "amount")]},
+        ]))]});
+        assert!(close(parse_fireworks_models(&list)[0].output_price, 7.0));
+    }
 
-#[test]
-fn fireworks_models_without_modes_have_unknown_prices() {
-    let list = json!({"models": [fw_model("m", json!([])), {"name": "n"}, {"nope": 1}]});
-    let models = parse_fireworks_models(&list);
-    assert_eq!(models.len(), 2);
-    assert!(models.iter().all(|m| m.input_price.is_none() && m.output_price.is_none()));
-}
+    #[test]
+    fn fireworks_models_without_modes_have_unknown_prices() {
+        let list = json!({"models": [fw_model("m", json!([])), {"name": "n"}, {"nope": 1}]});
+        let models = parse_fireworks_models(&list);
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().all(|m| m.input_price.is_none() && m.output_price.is_none()));
+    }
 
-#[test]
-fn fireworks_next_page_token_ignores_empty() {
-    assert_eq!(next_page_token(&json!({"nextPageToken": "abc"})), Some("abc".to_string()));
-    assert_eq!(next_page_token(&json!({"nextPageToken": ""})), None);
-    assert_eq!(next_page_token(&json!({})), None);
-}
+    #[test]
+    fn fireworks_models_url_is_scoped_to_the_account() {
+        assert_eq!(
+            fireworks_models_url("https://api.fireworks.ai/inference/v1", "acct"),
+            "https://api.fireworks.ai/v1/accounts/acct/serverlessModels"
+        );
+    }
+
+    #[test]
+    fn fireworks_next_page_token_ignores_empty() {
+        assert_eq!(next_page_token(&json!({"nextPageToken": "abc"})), Some("abc".to_string()));
+        assert_eq!(next_page_token(&json!({"nextPageToken": ""})), None);
+        assert_eq!(next_page_token(&json!({})), None);
+    }
 
     #[test]
     fn litellm_usage_reads_metadata_totals() {

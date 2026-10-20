@@ -49,7 +49,7 @@ credential_store = "file"
 | `type` | yes | `litellm` or `fireworks` | `add-provider --type` |
 | `base_url` | yes | Gateway URL. Fireworks defaults to `https://api.fireworks.ai/inference/v1`; LiteLLM has no default | `--base-url` |
 | `alias` | no | Short name accepted anywhere a gateway name is, such as `-g fw` | `--alias` (`edit-provider --alias ""` removes it) |
-| `account_id` | no | Fireworks account id, needed for `usage` | `--account-id` |
+| `account_id` | no | Fireworks account id, needed for `usage` and for `list-models` prices | `--account-id` |
 | `credential_store` | no | Where the API key is kept: `keychain` or `file`. A gateway without this field uses `file` | `--credential-store` |
 
 Rules for names and aliases:
