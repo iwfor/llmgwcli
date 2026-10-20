@@ -878,3 +878,47 @@ fn verbose_still_shows_rate_limit_waits() {
     assert!(err.contains("rate limited (429)"), "{err}");
     assert!(err.contains("-> 200 OK"), "{err}");
 }
+
+const FIREWORKS_SERVERLESS: &str = r#"{"models": [{"name": "accounts/fireworks/models/kimi", "serverlessModes": [
+    {"serviceTier": "standard", "skuInfos": [
+        {"sku": "LLM input tokens (uncached)", "amount": {"currencyCode": "USD", "units": "0", "nanos": 600000000}, "unit": "1M tokens"},
+        {"sku": "LLM output tokens", "amount": {"currencyCode": "USD", "units": "2", "nanos": 500000000}, "unit": "1M tokens"}]}]}]}"#;
+
+fn add_fireworks(env: &Env, mock: &Mock) {
+    env.ok(&[
+        "add-provider", "fw", "--type", "fireworks", "--api-key", "good-key",
+        "--base-url", &format!("{}/inference/v1", mock.base),
+    ]);
+}
+
+#[test]
+fn list_models_fireworks_reads_prices_from_serverless_models() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/v1/serverless-models", FIREWORKS_SERVERLESS)]);
+    add_fireworks(&env, &mock);
+    let out = env.ok(&["list-models", "--json"]);
+    assert!(out.contains("accounts/fireworks/models/kimi"), "{out}");
+    assert!(out.contains("0.6") && out.contains("2.5"), "{out}");
+    assert!(mock.requests().iter().all(|p| p.starts_with("/v1/serverless-models")), "{:?}", mock.requests());
+}
+
+#[test]
+fn list_models_fireworks_follows_page_tokens() {
+    let env = Env::new();
+    let first = r#"{"models": [{"name": "one"}], "nextPageToken": "p2"}"#;
+    let second = r#"{"models": [{"name": "two"}]}"#;
+    let mock = Mock::start_replies(&[("/v1/serverless-models", vec![Reply::ok(first), Reply::ok(second)])]);
+    add_fireworks(&env, &mock);
+    let out = env.ok(&["list-models"]);
+    assert!(out.contains("one") && out.contains("two"), "{out}");
+    assert!(mock.requests().iter().any(|p| p.contains("pageToken=p2")), "{:?}", mock.requests());
+}
+
+#[test]
+fn list_models_fireworks_falls_back_to_plain_list_without_prices() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/inference/v1/models", r#"{"data": [{"id": "plain-model"}]}"#)]);
+    add_fireworks(&env, &mock);
+    let out = env.ok(&["list-models"]);
+    assert!(out.contains("plain-model"), "{out}");
+}

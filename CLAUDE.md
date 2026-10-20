@@ -53,7 +53,7 @@ Commands keep the `*-provider` names; "gateway" is the user-facing word.
 
 ## Provider notes
 - LiteLLM: needs `--base-url`. Models: `GET /model/info` (prices), falls back to `/v1/models` (no prices). Usage: `GET /user/daily/activity?start_date&end_date`, reads `metadata.total_*` (tested only against a mock; docs do not say if `end_date` is inclusive).
-- Fireworks: default base URL `https://api.fireworks.ai/inference/v1`. Models: `GET /models`; the price fields (`pricing.input/output`) are a guess, NOT verified.
+- Fireworks: default base URL `https://api.fireworks.ai/inference/v1`. Models: `GET https://api.fireworks.ai/v1/serverless-models` (paged with `pageSize`/`nextPageToken`), prices from `serverlessModes[].skuInfos[]` (`amount` or `price` = `units` + `nanos`/1e9 USD per 1M tokens; SKUs "LLM input tokens (uncached)" and "LLM output tokens"). The standard tier is shown (else the first mode). If that call fails, falls back to `GET /models` (no prices). Per the docs; response shape NOT verified against the real API.
 - Fireworks usage needs `account_id`. Cost: `GET https://api.fireworks.ai/v1/accounts/{id}/billing/summary` (sums every `totalCost`); tokens: `GET .../billingUsage` (sums `promptTokens`/`completionTokens`). Params `startTime`/`endTime` (RFC 3339, end exclusive, max 31 days). Response shapes are NOT verified; parsing is lenient.
 
 ## License
