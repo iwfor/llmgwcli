@@ -1,5 +1,6 @@
 //! Gateway providers: listing models and querying usage.
 
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,6 +11,7 @@ use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::cache::GatewayCache;
 use crate::store::ProviderConfig;
 use crate::verbose::{redact_str, vlog};
 
@@ -45,21 +47,67 @@ pub struct Usage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub requests: Option<u64>,
+    /// Per-model breakdown, sorted by model name. Empty if not reported.
+    pub models: Vec<ModelUsage>,
 }
 
-pub fn list_models(cfg: &ProviderConfig, api_key: &str) -> Result<Vec<Model>> {
+/// One model's share of a gateway's usage.
+#[derive(Debug, Default)]
+pub struct ModelUsage {
+    pub model: String,
+    /// USD.
+    pub cost: Option<f64>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub requests: Option<u64>,
+}
+
+impl ModelUsage {
+    fn add(&mut self, other: &ModelUsage) {
+        let count = |a: Option<u64>, b: Option<u64>| add_opt(a.map(|n| n as f64), b.map(|n| n as f64)).map(|n| n as u64);
+        self.cost = add_opt(self.cost, other.cost);
+        self.prompt_tokens = count(self.prompt_tokens, other.prompt_tokens);
+        self.completion_tokens = count(self.completion_tokens, other.completion_tokens);
+        self.requests = count(self.requests, other.requests);
+    }
+}
+
+/// Merges entries for the same model (such as one per day), sorted by name.
+fn merge_models(entries: impl IntoIterator<Item = ModelUsage>) -> Vec<ModelUsage> {
+    let mut merged: BTreeMap<String, ModelUsage> = BTreeMap::new();
+    for entry in entries {
+        match merged.get_mut(&entry.model) {
+            Some(total) => total.add(&entry),
+            None => {
+                merged.insert(entry.model.clone(), entry);
+            }
+        }
+    }
+    merged.into_values().collect()
+}
+
+/// Sum that treats `None` as "no data" rather than zero.
+fn add_opt(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x + y),
+        (x, None) => x,
+        (None, y) => y,
+    }
+}
+
+pub fn list_models(cfg: &ProviderConfig, api_key: &str, cache: &GatewayCache) -> Result<Vec<Model>> {
     let base = cfg.base_url.trim_end_matches('/');
     match cfg.kind {
-        ProviderKind::Litellm => litellm_models(base, api_key),
-        ProviderKind::Fireworks => fireworks_models(cfg, base, api_key),
+        ProviderKind::Litellm => litellm_models(base, api_key, cache),
+        ProviderKind::Fireworks => fireworks_models(cfg, base, api_key, cache),
     }
 }
 
 /// Usage from `start` (inclusive) to `end` (exclusive), in UTC.
-pub fn usage(cfg: &ProviderConfig, api_key: &str, start: NaiveDate, end: NaiveDate) -> Result<Usage> {
+pub fn usage(cfg: &ProviderConfig, api_key: &str, start: NaiveDate, end: NaiveDate, cache: &GatewayCache) -> Result<Usage> {
     match cfg.kind {
         ProviderKind::Litellm => litellm_usage(cfg.base_url.trim_end_matches('/'), api_key, start, end),
-        ProviderKind::Fireworks => fireworks_usage(cfg, api_key, start, end),
+        ProviderKind::Fireworks => fireworks_usage(cfg, api_key, start, end, cache),
     }
 }
 
@@ -162,9 +210,11 @@ fn data_items(value: &Value) -> impl Iterator<Item = &Value> {
     value["data"].as_array().into_iter().flatten()
 }
 
-/// LiteLLM's /model/info has prices; fall back to /v1/models (no prices).
-fn litellm_models(base: &str, api_key: &str) -> Result<Vec<Model>> {
-    match get_json(&format!("{base}/model/info"), api_key, &[]) {
+/// LiteLLM's /model/info has prices (cached for a day); fall back to
+/// /v1/models (no prices, not cached).
+fn litellm_models(base: &str, api_key: &str, cache: &GatewayCache) -> Result<Vec<Model>> {
+    let url = format!("{base}/model/info");
+    match cache.get_or_fetch(&url, Utc::now(), || get_json(&url, api_key, &[])) {
         Ok(info) => Ok(parse_litellm_models(&info)),
         // Rate limiting is not a reason to try another endpoint.
         Err(e) if e.is::<RateLimitError>() => Err(e),
@@ -189,9 +239,9 @@ fn parse_litellm_models(info: &Value) -> Vec<Model> {
 /// Prices come from the account API (`/v1/accounts/{id}/serverlessModels`),
 /// not the OpenAI-style `/models` list, which has none. Without an account id,
 /// or if that call fails, fall back to the plain list (no prices).
-fn fireworks_models(cfg: &ProviderConfig, base: &str, api_key: &str) -> Result<Vec<Model>> {
+fn fireworks_models(cfg: &ProviderConfig, base: &str, api_key: &str, cache: &GatewayCache) -> Result<Vec<Model>> {
     let priced = match cfg.account_id.as_deref() {
-        Some(account) => fireworks_priced_models(&fireworks_models_url(base, account), api_key),
+        Some(account) => fireworks_priced_models(&fireworks_models_url(base, account), api_key, cache),
         None => Err(anyhow::anyhow!("no account id")),
     };
     match priced {
@@ -213,8 +263,21 @@ fn fireworks_models_url(base_url: &str, account: &str) -> String {
 /// Safety stop for a server that keeps returning page tokens.
 const MAX_PAGES: usize = 100;
 
-fn fireworks_priced_models(url: &str, api_key: &str) -> Result<Vec<Model>> {
-    let mut models = Vec::new();
+fn fireworks_priced_models(url: &str, api_key: &str, cache: &GatewayCache) -> Result<Vec<Model>> {
+    let pages = fireworks_cached_pages(url, api_key, cache)?;
+    Ok(pages.iter().flat_map(parse_fireworks_models).collect())
+}
+
+/// The serverless models list (prices and display names), fetched at most
+/// once a day.
+fn fireworks_cached_pages(url: &str, api_key: &str, cache: &GatewayCache) -> Result<Vec<Value>> {
+    let pages = cache.get_or_fetch(url, Utc::now(), || Ok(Value::Array(fireworks_pages(url, api_key)?)))?;
+    Ok(pages.as_array().cloned().unwrap_or_default())
+}
+
+/// Every page of a Fireworks list call, following `nextPageToken`.
+fn fireworks_pages(url: &str, api_key: &str) -> Result<Vec<Value>> {
+    let mut pages = Vec::new();
     let mut token: Option<String> = None;
     for _ in 0..MAX_PAGES {
         let mut query = vec![("pageSize", "200")];
@@ -222,13 +285,13 @@ fn fireworks_priced_models(url: &str, api_key: &str) -> Result<Vec<Model>> {
             query.push(("pageToken", t));
         }
         let page = get_json(url, api_key, &query)?;
-        models.extend(parse_fireworks_models(&page));
         token = next_page_token(&page);
+        pages.push(page);
         if token.is_none() {
             break;
         }
     }
-    Ok(models)
+    Ok(pages)
 }
 
 fn next_page_token(page: &Value) -> Option<String> {
@@ -297,10 +360,27 @@ fn parse_litellm_usage(report: &Value) -> Usage {
     let totals = &report["metadata"];
     Usage {
         cost: number(&totals["total_spend"]),
-        prompt_tokens: number(&totals["total_prompt_tokens"]).map(|n| n as u64),
-        completion_tokens: number(&totals["total_completion_tokens"]).map(|n| n as u64),
-        requests: number(&totals["total_api_requests"]).map(|n| n as u64),
+        prompt_tokens: count(&totals["total_prompt_tokens"]),
+        completion_tokens: count(&totals["total_completion_tokens"]),
+        requests: count(&totals["total_api_requests"]),
+        models: parse_litellm_models_usage(report),
     }
+}
+
+/// The daily `breakdown.models` entries, summed over the days.
+fn parse_litellm_models_usage(report: &Value) -> Vec<ModelUsage> {
+    let days = report["results"].as_array().into_iter().flatten();
+    let entries = days.filter_map(|day| day["breakdown"]["models"].as_object()).flatten();
+    merge_models(entries.map(|(model, entry)| {
+        let metrics = &entry["metrics"];
+        ModelUsage {
+            model: model.clone(),
+            cost: number(&metrics["spend"]),
+            prompt_tokens: count(&metrics["prompt_tokens"]),
+            completion_tokens: count(&metrics["completion_tokens"]),
+            requests: count(&metrics["api_requests"]),
+        }
+    }))
 }
 
 /// The account API lives at the host root, e.g. https://api.fireworks.ai,
@@ -310,7 +390,7 @@ fn fireworks_api_root(base_url: &str) -> &str {
     root.trim_end_matches('/')
 }
 
-fn fireworks_usage(cfg: &ProviderConfig, api_key: &str, start: NaiveDate, end: NaiveDate) -> Result<Usage> {
+fn fireworks_usage(cfg: &ProviderConfig, api_key: &str, start: NaiveDate, end: NaiveDate, cache: &GatewayCache) -> Result<Usage> {
     let account = cfg
         .account_id
         .as_deref()
@@ -320,16 +400,67 @@ fn fireworks_usage(cfg: &ProviderConfig, api_key: &str, start: NaiveDate, end: N
     let range = [("startTime", start.as_str()), ("endTime", end.as_str())];
     let summary = get_json(&format!("{base}/billing/summary"), api_key, &range)?;
     let tokens = get_json(&format!("{base}/billingUsage"), api_key, &range)?;
-    Ok(parse_fireworks_usage(&summary, &tokens))
+    // The summary prices models by display name; the usage rows only have ids.
+    // Without the names the per-model cost is just unknown, so don't fail.
+    let names = fireworks_cached_pages(&fireworks_models_url(&cfg.base_url, account), api_key, cache)
+        .map(|pages| pages.iter().flat_map(fireworks_display_names).collect())
+        .unwrap_or_else(|e| {
+            vlog!("model display names unavailable ({e:#}); per-model costs may be missing");
+            HashMap::new()
+        });
+    Ok(parse_fireworks_usage(&summary, &tokens, &names))
 }
 
-fn parse_fireworks_usage(summary: &Value, tokens: &Value) -> Usage {
+fn parse_fireworks_usage(summary: &Value, tokens: &Value, display_names: &HashMap<String, String>) -> Usage {
     Usage {
         cost: sum_field(summary, "totalCost"),
         prompt_tokens: sum_field(tokens, "promptTokens").map(|n| n as u64),
         completion_tokens: sum_field(tokens, "completionTokens").map(|n| n as u64),
         requests: None,
+        models: parse_fireworks_models_usage(summary, tokens, display_names),
     }
+}
+
+/// Model id -> display name, from a page of serverless models.
+fn fireworks_display_names(page: &Value) -> impl Iterator<Item = (String, String)> + '_ {
+    let items = page["models"].as_array().into_iter().flatten();
+    items.filter_map(|item| Some((item["name"].as_str()?.to_string(), item["displayName"].as_str()?.to_string())))
+}
+
+/// The rows of `billingUsage` (serverless, dedicated, training), summed per
+/// model. The cost is what `billing/summary` charged for the model's display
+/// name; `costNanoUsd` is only a fallback because it is often 0.
+fn parse_fireworks_models_usage(
+    summary: &Value,
+    tokens: &Value,
+    display_names: &HashMap<String, String>,
+) -> Vec<ModelUsage> {
+    let rows = ["serverlessCosts", "dedicatedCosts", "trainingCosts"]
+        .into_iter()
+        .flat_map(|list| tokens[list].as_array().into_iter().flatten());
+    let mut models = merge_models(rows.filter_map(|row| {
+        Some(ModelUsage {
+            model: row["modelName"].as_str()?.to_string(),
+            // A cost of zero means the row is not priced yet; keep it unknown.
+            cost: number(&row["costNanoUsd"]).filter(|n| *n > 0.0).map(|n| n / 1e9),
+            prompt_tokens: count(&row["promptTokens"]),
+            completion_tokens: count(&row["completionTokens"]),
+            requests: None,
+        })
+    }));
+    for model in &mut models {
+        let billed = display_names.get(&model.model).and_then(|name| model_bucket_cost(summary, name));
+        model.cost = billed.or(model.cost);
+    }
+    models
+}
+
+/// What `billing/summary` charged for the model with this display name.
+fn model_bucket_cost(summary: &Value, display_name: &str) -> Option<f64> {
+    let lines = summary["lineItems"].as_array().into_iter().flatten();
+    lines
+        .filter(|l| l["groupingKey"] == "model_bucket" && l["groupingValue"] == display_name)
+        .fold(None, |total, l| add_opt(total, money(&l["totalCost"])))
 }
 
 /// Prices may arrive as JSON numbers or strings.
@@ -337,18 +468,28 @@ fn number(value: &Value) -> Option<f64> {
     value.as_f64().or_else(|| value.as_str()?.parse().ok())
 }
 
-/// Sums every numeric `name` field found anywhere in `value`.
+/// Money as USD: `{"units": "1", "nanos": 500000000}` is 1.5. Plain numbers
+/// and numeric strings are accepted too.
+fn money(value: &Value) -> Option<f64> {
+    if !value.is_object() {
+        return number(value);
+    }
+    let (units, nanos) = (number(&value["units"]), number(&value["nanos"]));
+    add_opt(units, nanos.map(|n| n / 1e9))
+}
+
+/// A non-negative whole number sent as a JSON number or string.
+fn count(value: &Value) -> Option<u64> {
+    number(value).map(|n| n as u64)
+}
+
+/// Sums every `name` field (number or money) found anywhere in `value`.
 fn sum_field(value: &Value, name: &str) -> Option<f64> {
-    let add = |a: Option<f64>, b: Option<f64>| match (a, b) {
-        (Some(x), Some(y)) => Some(x + y),
-        (x, None) => x,
-        (None, y) => y,
-    };
     match value {
         Value::Object(map) => map.iter().fold(None, |acc, (key, v)| {
-            add(acc, if key == name { number(v) } else { sum_field(v, name) })
+            add_opt(acc, if key == name { money(v) } else { sum_field(v, name) })
         }),
-        Value::Array(items) => items.iter().fold(None, |acc, v| add(acc, sum_field(v, name))),
+        Value::Array(items) => items.iter().fold(None, |acc, v| add_opt(acc, sum_field(v, name))),
         _ => None,
     }
 }
@@ -398,7 +539,7 @@ mod tests {
     #[test]
     fn sum_field_none_when_absent_or_not_numeric() {
         assert_eq!(sum_field(&json!({"a": 1}), "cost"), None);
-        assert_eq!(sum_field(&json!({"cost": {"units": 1}}), "cost"), None);
+        assert_eq!(sum_field(&json!({"cost": {"other": 1}}), "cost"), None);
         assert_eq!(sum_field(&json!(5), "cost"), None);
     }
 
@@ -520,11 +661,119 @@ mod tests {
         let tokens = json!({"serverlessCosts": [
             {"promptTokens": "100", "completionTokens": "10"},
             {"promptTokens": "200", "completionTokens": "20"}]});
-        let usage = parse_fireworks_usage(&summary, &tokens);
+        let usage = parse_fireworks_usage(&summary, &tokens, &Default::default());
         assert_eq!(usage.cost, Some(2.0));
         assert_eq!(usage.prompt_tokens, Some(300));
         assert_eq!(usage.completion_tokens, Some(30));
         assert_eq!(usage.requests, None);
+    }
+
+    #[test]
+    fn money_reads_units_and_nanos() {
+        assert!(close(money(&json!({"units": "1", "nanos": 500_000_000})), 1.5));
+        assert!(close(money(&json!({"currencyCode": "USD", "nanos": 2100})), 2.1e-6));
+        assert!(close(money(&json!({"units": 3})), 3.0));
+        assert!(close(money(&json!(1.5)), 1.5));
+        assert!(close(money(&json!("2.5")), 2.5));
+        assert_eq!(money(&json!({})), None);
+        assert_eq!(money(&json!(null)), None);
+    }
+
+    #[test]
+    fn fireworks_usage_sums_money_costs() {
+        let line = |nanos| json!({"totalCost": {"currencyCode": "USD", "units": "0", "nanos": nanos}});
+        let summary = json!({"lineItems": [line(2100), line(63_500)], "usageBuckets": []});
+        let usage = parse_fireworks_usage(&summary, &json!({}), &Default::default());
+        assert!(close(usage.cost, 6.56e-5), "{:?}", usage.cost);
+    }
+
+    #[test]
+    fn fireworks_usage_lists_models_with_tokens_and_cost() {
+        let row = |model: &str, prompt: &str, completion: &str, nanos: u64| {
+            json!({"modelName": model, "promptTokens": prompt, "completionTokens": completion, "costNanoUsd": nanos})
+        };
+        let tokens = json!({
+            "serverlessCosts": [row("b", "100", "10", 2_000_000_000), row("a", "5", "1", 0), row("b", "50", "5", 500_000_000)],
+            "dedicatedCosts": [row("c", "1", "2", 0)],
+            "trainingCosts": [],
+        });
+        let usage = parse_fireworks_usage(&json!({}), &tokens, &Default::default());
+        let names: Vec<_> = usage.models.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        let b = &usage.models[1];
+        assert_eq!((b.prompt_tokens, b.completion_tokens), (Some(150), Some(15)));
+        assert!(close(b.cost, 2.5));
+        // A zero cost means the API has not priced the row; show it as unknown.
+        assert_eq!(usage.models[0].cost, None);
+        assert_eq!(b.requests, None);
+    }
+
+    #[test]
+    fn fireworks_display_names_map_model_ids() {
+        let page = json!({"models": [
+            {"name": "accounts/fireworks/models/a", "displayName": "Model A"},
+            {"name": "accounts/fireworks/models/b"},
+            {"displayName": "No Name"}]});
+        let names: HashMap<_, _> = fireworks_display_names(&page).collect();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names["accounts/fireworks/models/a"], "Model A");
+    }
+
+    #[test]
+    fn fireworks_model_cost_comes_from_summary_lines_for_its_display_name() {
+        let line = |key: &str, value: &str, nanos: u64| {
+            json!({"groupingKey": key, "groupingValue": value,
+                   "totalCost": {"currencyCode": "USD", "units": "0", "nanos": nanos}})
+        };
+        let summary = json!({"lineItems": [
+            line("model_bucket", "GLM 5.3 Flash", 2100),
+            line("model_bucket", "GLM 5.3 Flash", 63_500),
+            line("model_bucket", "Other", 9_000),
+            line("account", "GLM 5.3 Flash", 7_000)]});
+        let row = |model: &str| json!({"modelName": model, "promptTokens": "1", "completionTokens": "1", "costNanoUsd": 0});
+        let tokens = json!({"serverlessCosts": [row("glm"), row("unnamed")]});
+        let names = std::collections::HashMap::from([("glm".to_string(), "GLM 5.3 Flash".to_string())]);
+        let usage = parse_fireworks_usage(&summary, &tokens, &names);
+        assert!(close(usage.models[0].cost, 6.56e-5), "{:?}", usage.models[0]);
+        // No display name, no summary lines: still unknown.
+        assert_eq!(usage.models[1].cost, None);
+    }
+
+    #[test]
+    fn fireworks_summary_cost_wins_over_nano_usd() {
+        let summary = json!({"lineItems": [{"groupingKey": "model_bucket", "groupingValue": "M",
+            "totalCost": {"units": "2", "nanos": 0}}]});
+        let tokens = json!({"serverlessCosts": [{"modelName": "m", "costNanoUsd": 1_000_000_000}]});
+        let names = std::collections::HashMap::from([("m".to_string(), "M".to_string())]);
+        assert!(close(parse_fireworks_usage(&summary, &tokens, &names).models[0].cost, 2.0));
+    }
+
+    #[test]
+    fn fireworks_usage_without_rows_has_no_models() {
+        assert!(parse_fireworks_usage(&json!({}), &json!({}), &Default::default()).models.is_empty());
+    }
+
+    #[test]
+    fn litellm_usage_lists_models_summed_over_days() {
+        let day = |spend: f64, prompt: u64, requests: u64| {
+            json!({"breakdown": {"models": {
+                "m1": {"metrics": {"spend": spend, "prompt_tokens": prompt, "completion_tokens": 1, "api_requests": requests}},
+                "m0": {"metrics": {"spend": 1.0, "prompt_tokens": 2, "completion_tokens": 3, "api_requests": 4}},
+            }}})
+        };
+        let report = json!({"results": [day(0.5, 10, 1), day(0.25, 20, 2)], "metadata": {}});
+        let usage = parse_litellm_usage(&report);
+        let names: Vec<_> = usage.models.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(names, ["m0", "m1"]);
+        let m1 = &usage.models[1];
+        assert!(close(m1.cost, 0.75));
+        assert_eq!((m1.prompt_tokens, m1.completion_tokens, m1.requests), (Some(30), Some(2), Some(3)));
+    }
+
+    #[test]
+    fn litellm_usage_without_breakdown_has_no_models() {
+        assert!(parse_litellm_usage(&json!({"results": [{"date": "2026-10-01"}]})).models.is_empty());
+        assert!(parse_litellm_usage(&json!({})).models.is_empty());
     }
 
     #[test]
@@ -547,7 +796,8 @@ mod tests {
             credential_store: crate::store::CredentialStore::File,
         };
         let day = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
-        let err = fireworks_usage(&cfg, "k", day, day).unwrap_err();
+        let cache = GatewayCache::new(std::path::Path::new("/nonexistent"), "fw", false);
+        let err = fireworks_usage(&cfg, "k", day, day, &cache).unwrap_err();
         assert!(err.to_string().contains("account id"));
     }
     // --- rate limiting ---

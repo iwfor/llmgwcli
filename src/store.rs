@@ -119,6 +119,10 @@ impl Store {
         Ok(store)
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
@@ -222,7 +226,7 @@ fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 /// Writes a file readable only by the current user.
-fn write_private(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)

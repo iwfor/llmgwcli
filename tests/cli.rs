@@ -13,9 +13,26 @@ const LITELLM_MODELS: &str = r#"{"data": [
     {"model_name": "llama-70b", "model_info": {"input_cost_per_token": 0.0000009, "output_cost_per_token": 0.0000018}},
     {"model_name": "mixtral", "model_info": {}}]}"#;
 const LITELLM_USAGE: &str = r#"{"metadata": {"total_spend": 12.3456,
-    "total_prompt_tokens": 1000, "total_completion_tokens": 500, "total_api_requests": 42}}"#;
-const FIREWORKS_SUMMARY: &str = r#"{"lineItems": [{"totalCost": "1.5"}, {"totalCost": "0.25"}]}"#;
-const FIREWORKS_TOKENS: &str = r#"{"rows": [{"promptTokens": "300", "completionTokens": "30"}]}"#;
+    "total_prompt_tokens": 1000, "total_completion_tokens": 500, "total_api_requests": 42},
+    "results": [
+        {"date": "2026-10-01", "breakdown": {"models": {
+            "llama-70b": {"metrics": {"spend": 10.0, "prompt_tokens": 600, "completion_tokens": 300, "api_requests": 30}}}}},
+        {"date": "2026-10-02", "breakdown": {"models": {
+            "llama-70b": {"metrics": {"spend": 1.5, "prompt_tokens": 100, "completion_tokens": 50, "api_requests": 2}},
+            "mixtral": {"metrics": {"spend": 0.8456, "prompt_tokens": 300, "completion_tokens": 150, "api_requests": 10}}}}}]}"#;
+const FIREWORKS_SUMMARY: &str = r#"{"lineItems": [
+    {"category": "LLM input tokens (uncached)", "groupingKey": "model_bucket", "groupingValue": "Kimi",
+     "totalCost": {"currencyCode": "USD", "units": "1", "nanos": 500000000}},
+    {"category": "LLM output tokens", "groupingKey": "model_bucket", "groupingValue": "GLM",
+     "totalCost": {"currencyCode": "USD", "units": "0", "nanos": 250000000}}]}"#;
+/// The serverless models list: gives each model id its display name.
+const FIREWORKS_NAMES: &str = r#"{"models": [
+    {"name": "accounts/fireworks/models/kimi", "displayName": "Kimi"},
+    {"name": "accounts/fireworks/models/glm", "displayName": "GLM"}]}"#;
+const FIREWORKS_TOKENS: &str = r#"{"serverlessCosts": [
+    {"modelName": "accounts/fireworks/models/kimi", "promptTokens": "200", "completionTokens": "20", "costNanoUsd": 1000000000},
+    {"modelName": "accounts/fireworks/models/glm", "promptTokens": "100", "completionTokens": "10", "costNanoUsd": 0}],
+    "dedicatedCosts": [], "trainingCosts": []}"#;
 
 /// One canned HTTP response.
 #[derive(Clone)]
@@ -340,6 +357,10 @@ fn usage_litellm_prints_month_totals() {
     env.add_litellm("lite", &mock, "good-key", &[]);
     let out = env.ok(&["usage", "-g", "lite"]);
     assert!(out.contains("12.3456") && out.contains("1000") && out.contains("500") && out.contains("42"), "{out}");
+let (totals, by_model) = out.split_once("Usage by model").expect(&out);
+assert!(!totals.contains("llama-70b"), "{out}");
+let rows: Vec<Vec<&str>> = by_model.lines().skip(2).map(|l| l.split_whitespace().collect()).collect();
+assert_eq!(rows, [["lite", "llama-70b", "11.5000", "700", "350", "32"], ["lite", "mixtral", "0.8456", "300", "150", "10"]], "{out}");
     let request = mock.requests().pop().unwrap();
     let month = chrono::Utc::now().format("%Y-%m-01").to_string();
     assert!(request.contains(&format!("start_date={month}")), "{request}");
@@ -352,6 +373,7 @@ fn usage_fireworks_uses_account_billing_endpoints() {
     let mock = Mock::start(&[
         ("/billing/summary", FIREWORKS_SUMMARY),
         ("/billingUsage", FIREWORKS_TOKENS),
+("/serverlessModels", FIREWORKS_NAMES),
     ]);
     env.ok(&[
         "add-provider", "fw", "--type", "fireworks", "--api-key", "good-key",
@@ -359,6 +381,13 @@ fn usage_fireworks_uses_account_billing_endpoints() {
     ]);
     let out = env.ok(&["usage"]);
     assert!(out.contains("1.7500") && out.contains("300") && out.contains("30"), "{out}");
+let (_, by_model) = out.split_once("Usage by model").expect(&out);
+let rows: Vec<Vec<&str>> = by_model.lines().skip(2).map(|l| l.split_whitespace().collect()).collect();
+// Costs come from the summary by display name, not from costNanoUsd.
+assert_eq!(rows, [
+    ["fw", "accounts/fireworks/models/glm", "0.2500", "100", "10", "-"],
+    ["fw", "accounts/fireworks/models/kimi", "1.5000", "200", "20", "-"],
+], "{out}");
     let requests = mock.requests();
     assert!(requests.iter().all(|p| p.starts_with("/v1/accounts/acct/")), "{requests:?}");
     assert!(requests.iter().any(|p| p.contains("startTime=") && p.contains("T00%3A00%3A00Z")));
@@ -723,6 +752,13 @@ fn usage_json_prints_the_month_and_totals() {
                             "completion_tokens": 500, "requests": 42}])
     );
     assert!(!out.contains("Usage "), "no table header in JSON mode: {out}");
+let models = usage["models"].as_array().unwrap();
+assert_eq!(models.len(), 2, "{out}");
+assert_eq!(
+    models[0],
+    serde_json::json!({"gateway": "lite", "model": "llama-70b", "cost_usd": 11.5,
+                       "prompt_tokens": 700, "completion_tokens": 350, "requests": 32})
+);
 }
 
 #[test]
@@ -932,4 +968,157 @@ fn list_models_fireworks_without_account_id_lists_models_without_prices() {
     let out = env.ok(&["list-models"]);
     assert!(out.contains("plain-model"), "{out}");
     assert!(mock.requests().iter().all(|p| !p.contains("serverlessModels")), "{:?}", mock.requests());
+}
+
+#[test]
+fn usage_fireworks_without_model_names_still_prints_totals_and_falls_back_to_nano_usd() {
+    let env = Env::new();
+    // No /serverlessModels route: the mock answers 404 for it.
+    let mock = Mock::start(&[
+        ("/billing/summary", FIREWORKS_SUMMARY),
+        ("/billingUsage", FIREWORKS_TOKENS),
+    ]);
+    env.ok(&[
+        "add-provider", "fw", "--type", "fireworks", "--api-key", "good-key",
+        "--base-url", &format!("{}/inference/v1", mock.base), "--account-id", "acct",
+    ]);
+    let out = env.ok(&["usage"]);
+    assert!(out.contains("1.7500"), "{out}");
+    let (_, by_model) = out.split_once("Usage by model").expect(&out);
+    let rows: Vec<Vec<&str>> = by_model.lines().skip(2).map(|l| l.split_whitespace().collect()).collect();
+    assert_eq!(rows, [
+        ["fw", "accounts/fireworks/models/glm", "-", "100", "10", "-"],
+        ["fw", "accounts/fireworks/models/kimi", "1.0000", "200", "20", "-"],
+    ], "{out}");
+}
+
+fn hits(mock: &Mock, fragment: &str) -> usize {
+    mock.requests().iter().filter(|p| p.contains(fragment)).count()
+}
+
+fn fireworks_mock() -> Mock {
+    Mock::start(&[
+        ("/billing/summary", FIREWORKS_SUMMARY),
+        ("/billingUsage", FIREWORKS_TOKENS),
+        ("/serverlessModels", FIREWORKS_NAMES),
+    ])
+}
+
+fn cache_file(env: &Env, gateway: &str) -> std::path::PathBuf {
+    env.dir().join("cache").join(format!("{gateway}.json"))
+}
+
+#[test]
+fn fireworks_prices_are_fetched_once_a_day() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/v1/accounts/acct/serverlessModels", FIREWORKS_SERVERLESS)]);
+    add_fireworks(&env, &mock);
+    let first = env.ok(&["list-models"]);
+    let second = env.ok(&["list-models"]);
+    assert_eq!(first, second);
+    assert!(second.contains("0.6000") && second.contains("2.5000"), "{second}");
+    assert_eq!(hits(&mock, "serverlessModels"), 1);
+}
+
+#[test]
+fn refresh_flag_fetches_prices_again() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/v1/accounts/acct/serverlessModels", FIREWORKS_SERVERLESS)]);
+    add_fireworks(&env, &mock);
+    env.ok(&["list-models"]);
+    env.ok(&["list-models", "--refresh"]);
+    assert_eq!(hits(&mock, "serverlessModels"), 2);
+    // The refreshed answer is cached again.
+    env.ok(&["list-models"]);
+    assert_eq!(hits(&mock, "serverlessModels"), 2);
+}
+
+#[test]
+fn prices_older_than_a_day_are_fetched_again() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/v1/accounts/acct/serverlessModels", FIREWORKS_SERVERLESS)]);
+    add_fireworks(&env, &mock);
+    env.ok(&["list-models"]);
+    let path = cache_file(&env, "fw");
+    let mut entry: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    entry["fetched_at"] = (chrono::Utc::now().timestamp() - 25 * 3600).into();
+    std::fs::write(&path, entry.to_string()).unwrap();
+    env.ok(&["list-models"]);
+    assert_eq!(hits(&mock, "serverlessModels"), 2);
+}
+
+#[test]
+fn usage_reuses_cached_model_names_but_never_caches_usage() {
+    let env = Env::new();
+    let mock = fireworks_mock();
+    add_fireworks(&env, &mock);
+    env.ok(&["list-models"]);
+    let first = env.ok(&["usage"]);
+    env.ok(&["usage"]);
+    assert!(first.contains("0.2500"), "{first}");
+    assert_eq!(hits(&mock, "serverlessModels"), 1);
+    assert_eq!(hits(&mock, "billing/summary"), 2);
+    assert_eq!(hits(&mock, "billingUsage"), 2);
+}
+
+#[test]
+fn litellm_prices_are_cached_too() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/model/info", LITELLM_MODELS)]);
+    env.add_litellm("lite", &mock, "good-key", &[]);
+    env.ok(&["list-models"]);
+    let out = env.ok(&["list-models"]);
+    assert!(out.contains("llama-70b"), "{out}");
+    assert_eq!(hits(&mock, "/model/info"), 1);
+}
+
+#[test]
+fn cache_files_are_private_and_hold_no_api_key() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let mock = Mock::start(&[("/v1/accounts/acct/serverlessModels", FIREWORKS_SERVERLESS)]);
+    add_fireworks(&env, &mock);
+    env.ok(&["list-models"]);
+    let path = cache_file(&env, "fw");
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(path.parent().unwrap()), 0o700);
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("good-key"));
+}
+
+#[test]
+fn editing_or_removing_a_gateway_drops_its_cached_prices() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/v1/accounts/acct/serverlessModels", FIREWORKS_SERVERLESS)]);
+    add_fireworks(&env, &mock);
+    env.ok(&["list-models"]);
+    assert!(cache_file(&env, "fw").exists());
+    env.ok(&["edit-provider", "fw", "--alias", "f"]);
+    assert!(!cache_file(&env, "fw").exists());
+    env.ok(&["list-models"]);
+    assert!(cache_file(&env, "fw").exists());
+    env.ok(&["remove-provider", "fw"]);
+    assert!(!cache_file(&env, "fw").exists());
+}
+
+#[test]
+fn failed_fetches_are_not_cached() {
+    let env = Env::new();
+    // No routes at all: both Fireworks endpoints answer 404, so the list has no prices.
+    let mock = Mock::start(&[("/inference/v1/models", r#"{"data": [{"id": "plain-model"}]}"#)]);
+    add_fireworks(&env, &mock);
+    env.ok(&["list-models"]);
+    assert!(!cache_file(&env, "fw").exists());
+}
+
+#[test]
+fn verbose_says_when_cached_prices_are_used() {
+    let env = Env::new();
+    let mock = Mock::start(&[("/v1/accounts/acct/serverlessModels", FIREWORKS_SERVERLESS)]);
+    add_fireworks(&env, &mock);
+    env.ok(&["list-models"]);
+    let out = env.cmd(&["-v", "list-models"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("using cached response"), "{err}");
+    assert!(!err.contains("good-key"), "{err}");
 }

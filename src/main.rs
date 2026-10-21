@@ -1,3 +1,4 @@
+mod cache;
 mod crypto;
 mod keychain;
 mod provider;
@@ -12,6 +13,7 @@ use chrono::{Datelike, Months, NaiveDate, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
+use cache::GatewayCache;
 use provider::{Model, ProviderKind, Usage};
 use store::{ALL_GATEWAYS, Config, CredentialStore, ProviderConfig, Store};
 use verbose::{redact_str, vlog};
@@ -25,6 +27,9 @@ struct Cli {
     /// Explain what is happening on stderr (never shows API keys)
     #[arg(short, long, global = true)]
     verbose: bool,
+    /// Fetch per-model prices again instead of using those cached for up to 24 hours
+    #[arg(long, global = true)]
+    refresh: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -228,6 +233,8 @@ fn run(cli: Cli) -> Result<()> {
             }
             gateway.credential_store = new_store;
             store.save_config(&config)?;
+            // The key, URL or account may have changed.
+            GatewayCache::new(store.dir(), &name, false).remove();
             println!("Updated gateway '{name}'.");
         }
         Command::RemoveProvider { name } => {
@@ -236,11 +243,12 @@ fn run(cli: Cli) -> Result<()> {
             let removed = config.providers.remove(&name).expect("resolved name exists");
             store.remove_api_key(&name, removed.credential_store)?;
             store.save_config(&config)?;
+            GatewayCache::new(store.dir(), &name, false).remove();
             println!("Removed gateway '{name}'.");
         }
         Command::ListModels { gateway, output, filter } => {
-            let targets = targets(&store, &gateway.gateway)?;
-            let (results, failed) = gather(&targets, |t| provider::list_models(&t.cfg, &t.api_key));
+            let targets = targets(&store, &gateway.gateway, cli.refresh)?;
+            let (results, failed) = gather(&targets, |t| provider::list_models(&t.cfg, &t.api_key, &t.cache));
             if output.json {
                 print_json(&models_json(results, filter.as_deref()))?;
             } else {
@@ -251,16 +259,21 @@ fn run(cli: Cli) -> Result<()> {
         }
         Command::Completions { .. } => unreachable!("handled before the store opens"),
         Command::Usage { gateway, output } => {
-            let targets = targets(&store, &gateway.gateway)?;
+            let targets = targets(&store, &gateway.gateway, cli.refresh)?;
             let (start, end) = current_month();
             let (results, failed) =
-                gather(&targets, |t| provider::usage(&t.cfg, &t.api_key, start, end));
+                gather(&targets, |t| provider::usage(&t.cfg, &t.api_key, start, end, &t.cache));
             if output.json {
                 print_json(&usage_json(&results, start, end))?;
             } else {
                 let rows = results.iter().map(|(t, u)| usage_row(t, u)).collect();
                 println!("Usage {start} to {end} (end exclusive, UTC)");
                 print_table(&["GATEWAY", "COST (USD)", "PROMPT TOK", "COMPLETION TOK", "REQUESTS"], rows, 1);
+                let model_rows = model_usage_rows(&results);
+                if !model_rows.is_empty() {
+                    println!("\nUsage by model");
+                    print_table(&["GATEWAY", "MODEL", "COST (USD)", "PROMPT TOK", "COMPLETION TOK", "REQUESTS"], model_rows, 2);
+                }
             }
             finish(failed)?;
         }
@@ -278,9 +291,10 @@ struct Target {
     name: String,
     cfg: ProviderConfig,
     api_key: String,
+    cache: GatewayCache,
 }
 
-fn targets(store: &Store, gateway: &str) -> Result<Vec<Target>> {
+fn targets(store: &Store, gateway: &str, refresh: bool) -> Result<Vec<Target>> {
     let config: Config = store.load_config()?;
     config
         .select(gateway)?
@@ -296,7 +310,8 @@ fn targets(store: &Store, gateway: &str) -> Result<Vec<Target>> {
             let api_key = store
                 .api_key(&name, cfg.credential_store)?
                 .with_context(|| format!("no API key for '{name}'"))?;
-            Ok(Target { name, cfg, api_key })
+            let cache = GatewayCache::new(store.dir(), &name, refresh);
+            Ok(Target { name, cfg, api_key, cache })
         })
         .collect()
 }
@@ -354,11 +369,15 @@ fn or_dash<T>(value: Option<T>, show: impl Fn(T) -> String) -> String {
 /// Every model whose id contains `filter` (case-insensitive), with its gateway.
 fn filter_models<'a>(results: Vec<(&'a Target, Vec<Model>)>, filter: Option<&str>) -> Vec<(&'a Target, Model)> {
     let filter = filter.map(str::to_lowercase);
-    results
+    let mut models: Vec<_> = results
         .into_iter()
         .flat_map(|(t, models)| models.into_iter().map(move |m| (t, m)))
         .filter(|(_, m)| filter.as_ref().is_none_or(|f| m.id.to_lowercase().contains(f)))
-        .collect()
+        .collect();
+    // Sorted by gateway, then model (case-insensitive); the same model listed twice by one gateway shows once.
+    models.sort_by_cached_key(|(t, m)| (t.name.clone(), m.id.to_lowercase(), m.id.clone()));
+    models.dedup_by(|(t2, m2), (t1, m1)| t1.name == t2.name && m1.id == m2.id);
+    models
 }
 
 fn model_rows(results: Vec<(&Target, Vec<Model>)>, filter: Option<&str>) -> Vec<Vec<String>> {
@@ -403,7 +422,21 @@ fn usage_json(results: &[(&Target, Usage)], start: NaiveDate, end: NaiveDate) ->
             })
         })
         .collect();
-    serde_json::json!({ "start": start.to_string(), "end": end.to_string(), "usage": usage })
+    let models: Vec<_> = results
+        .iter()
+        .flat_map(|(t, u)| u.models.iter().map(move |m| (t, m)))
+        .map(|(t, m)| {
+            serde_json::json!({
+                "gateway": t.name,
+                "model": m.model,
+                "cost_usd": m.cost,
+                "prompt_tokens": m.prompt_tokens,
+                "completion_tokens": m.completion_tokens,
+                "requests": m.requests,
+            })
+        })
+        .collect();
+    serde_json::json!({ "start": start.to_string(), "end": end.to_string(), "usage": usage, "models": models })
 }
 
 fn print_json(value: &serde_json::Value) -> Result<()> {
@@ -412,14 +445,28 @@ fn print_json(value: &serde_json::Value) -> Result<()> {
 }
 
 fn usage_row(target: &Target, usage: &Usage) -> Vec<String> {
+    let mut row = vec![target.name.clone()];
+    row.extend(usage_cells(usage.cost, usage.prompt_tokens, usage.completion_tokens, usage.requests));
+    row
+}
+
+/// One row per model per gateway, for the "by model" table.
+fn model_usage_rows(results: &[(&Target, Usage)]) -> Vec<Vec<String>> {
+    results
+        .iter()
+        .flat_map(|(t, u)| u.models.iter().map(move |m| (t, m)))
+        .map(|(t, m)| {
+            let mut row = vec![t.name.clone(), m.model.clone()];
+            row.extend(usage_cells(m.cost, m.prompt_tokens, m.completion_tokens, m.requests));
+            row
+        })
+        .collect()
+}
+
+/// Cost, prompt tokens, completion tokens and requests as table cells.
+fn usage_cells(cost: Option<f64>, prompt: Option<u64>, completion: Option<u64>, requests: Option<u64>) -> Vec<String> {
     let count = |n: Option<u64>| or_dash(n, |n| n.to_string());
-    vec![
-        target.name.clone(),
-        or_dash(usage.cost, |c| format!("{c:.4}")),
-        count(usage.prompt_tokens),
-        count(usage.completion_tokens),
-        count(usage.requests),
-    ]
+    vec![or_dash(cost, |c| format!("{c:.4}")), count(prompt), count(completion), count(requests)]
 }
 
 fn prompt_key(name: &str) -> Result<String> {
@@ -461,6 +508,7 @@ fn format_table(header: &[&str], rows: Vec<Vec<String>>, left_cols: usize) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ModelUsage;
     use tempfile::TempDir;
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
@@ -478,6 +526,7 @@ mod tests {
                 credential_store: CredentialStore::File,
             },
             api_key: "k".into(),
+            cache: GatewayCache::new(std::path::Path::new("/nonexistent"), name, false),
         }
     }
 
@@ -656,6 +705,33 @@ mod tests {
     }
 
     #[test]
+    fn model_rows_are_sorted_by_gateway_then_model_and_unique() {
+        let (a, b) = (target("a"), target("b"));
+        let results = vec![
+            (&b, vec![model("z", None, None)]),
+            (&a, vec![model("m2", None, None), model("M1", None, None), model("m2", None, None)]),
+        ];
+        let rows = model_rows(results, None);
+        let ids: Vec<_> = rows.iter().map(|r| (r[0].as_str(), r[1].as_str())).collect();
+        assert_eq!(ids, [("a", "M1"), ("a", "m2"), ("b", "z")]);
+    }
+
+    #[test]
+    fn same_model_on_two_gateways_is_kept() {
+        let (a, b) = (target("a"), target("b"));
+        let results = vec![(&a, vec![model("m", None, None)]), (&b, vec![model("m", None, None)])];
+        assert_eq!(model_rows(results, None).len(), 2);
+    }
+
+    #[test]
+    fn models_json_is_sorted_and_unique() {
+        let t = target("a");
+        let json = models_json(vec![(&t, vec![model("b", None, None), model("a", None, None), model("b", None, None)])], None);
+        let ids: Vec<_> = json.as_array().unwrap().iter().map(|m| m["model"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
     fn model_rows_filter_without_match_is_empty() {
         let t = target("a");
         assert!(model_rows(vec![(&t, vec![model("x", None, None)])], Some("zzz")).is_empty());
@@ -664,7 +740,7 @@ mod tests {
     #[test]
     fn usage_row_formats_values_and_unknowns() {
         let t = target("fw");
-        let usage = Usage { cost: Some(1.5), prompt_tokens: Some(10), completion_tokens: None, requests: None };
+        let usage = Usage { cost: Some(1.5), prompt_tokens: Some(10), ..Default::default() };
         assert_eq!(usage_row(&t, &usage), ["fw", "1.5000", "10", "-", "-"]);
     }
 
@@ -733,7 +809,7 @@ mod tests {
     #[test]
     fn targets_all_loads_decrypted_keys() {
         let (_tmp, store) = store_with_gateways();
-        let all = targets(&store, "all").unwrap();
+        let all = targets(&store, "all", false).unwrap();
         let pairs: Vec<_> = all.iter().map(|t| (t.name.as_str(), t.api_key.as_str())).collect();
         assert_eq!(pairs, [("fireworks", "key-fireworks"), ("lite", "key-lite")]);
     }
@@ -741,7 +817,7 @@ mod tests {
     #[test]
     fn targets_resolves_alias() {
         let (_tmp, store) = store_with_gateways();
-        let one = targets(&store, "ll").unwrap();
+        let one = targets(&store, "ll", false).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].name, "lite");
     }
@@ -749,9 +825,9 @@ mod tests {
     #[test]
     fn targets_fails_for_unknown_gateway_or_missing_key() {
         let (_tmp, store) = store_with_gateways();
-        assert!(targets(&store, "nope").is_err());
+        assert!(targets(&store, "nope", false).is_err());
         store.remove_api_key("lite", CredentialStore::File).unwrap();
-        let err = targets(&store, "lite").err().unwrap();
+        let err = targets(&store, "lite", false).err().unwrap();
         assert!(err.to_string().contains("no API key for 'lite'"));
     }
     // --- --json output ---
@@ -808,7 +884,13 @@ mod tests {
     #[test]
     fn usage_json_has_the_period_and_one_object_per_gateway() {
         let (a, b) = (target("a"), target("b"));
-        let full = Usage { cost: Some(12.5), prompt_tokens: Some(10), completion_tokens: Some(5), requests: Some(2) };
+        let full = Usage {
+            cost: Some(12.5),
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            requests: Some(2),
+            models: vec![ModelUsage { model: "m".into(), cost: Some(1.5), prompt_tokens: Some(3), ..Default::default() }],
+        };
         let results = vec![(&a, full), (&b, Usage::default())];
         assert_eq!(
             usage_json(&results, date(2026, 10, 1), date(2026, 11, 1)),
@@ -819,6 +901,9 @@ mod tests {
                     {"gateway": "a", "cost_usd": 12.5, "prompt_tokens": 10, "completion_tokens": 5, "requests": 2},
                     {"gateway": "b", "cost_usd": null, "prompt_tokens": null, "completion_tokens": null, "requests": null},
                 ],
+                "models": [
+                    {"gateway": "a", "model": "m", "cost_usd": 1.5, "prompt_tokens": 3, "completion_tokens": null, "requests": null},
+                ],
             })
         );
     }
@@ -827,6 +912,31 @@ mod tests {
     fn usage_json_with_no_results_has_an_empty_list() {
         let json = usage_json(&[], date(2026, 10, 1), date(2026, 11, 1));
         assert_eq!(json["usage"], serde_json::json!([]));
+        assert_eq!(json["models"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn model_usage_rows_list_each_model_under_its_gateway() {
+        let (a, b) = (target("a"), target("b"));
+        let model = |name: &str, cost| ModelUsage {
+            model: name.into(),
+            cost,
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            requests: None,
+        };
+        let ua = Usage { models: vec![model("m1", Some(0.75)), model("m2", None)], ..Default::default() };
+        let results = vec![(&a, ua), (&b, Usage::default())];
+        assert_eq!(
+            model_usage_rows(&results),
+            [["a", "m1", "0.7500", "10", "5", "-"], ["a", "m2", "-", "10", "5", "-"]]
+        );
+    }
+
+    #[test]
+    fn model_usage_rows_are_empty_without_models() {
+        let t = target("a");
+        assert!(model_usage_rows(&[(&t, Usage::default())]).is_empty());
     }
     #[test]
     fn version_flag_exits_with_the_version_text() {

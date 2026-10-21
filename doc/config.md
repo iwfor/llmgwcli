@@ -22,8 +22,10 @@ and sets `0600` on the other files whenever it writes them.
 | `config.toml` | Gateways: type, URL, alias, account id, credential store |
 | `credentials.toml` | API keys for gateways that use the `file` credential store, encrypted |
 | `llmgwcli.key` | Random 32-character key that encrypts `credentials.toml` |
+| `cache/NAME.json` | Cached model prices for gateway `NAME` (see [Price cache](#price-cache)) |
 
-All files are TOML except `llmgwcli.key`, which is plain text.
+All files are TOML except `llmgwcli.key`, which is plain text, and the cache
+files, which are JSON.
 
 ## config.toml
 
@@ -109,6 +111,23 @@ The encryption protects against casual exposure, such as a backup that holds
 `credentials.toml` but not `llmgwcli.key`. It does not protect against someone
 who can read both files as you. The macOS Keychain is the stronger choice,
 which is why it is the default there.
+
+## Price cache
+
+`list-models` and `usage` keep each gateway's per-model price list in
+`cache/NAME.json` and reuse it for 24 hours, so repeated runs do not download
+it again. It holds the response of the price request (LiteLLM `/model/info`,
+Fireworks `serverlessModels`) with the time it was fetched and the URL it
+answers (without any credentials). It never holds API keys or usage figures:
+`usage` always asks the gateway for current spend and tokens.
+
+- Run any command with `--refresh` to ignore the cache and fetch fresh prices
+  (the new answer is cached again).
+- `edit-provider` and `remove-provider` delete the gateway's cache file.
+- A changed base URL or account id is a different request, so it is fetched
+  again.
+- The cache is safe to delete at any time. A cache file that cannot be read
+  or written is skipped, never an error.
 
 ## Backups and moving to another machine
 
